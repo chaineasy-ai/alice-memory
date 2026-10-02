@@ -174,8 +174,14 @@ class MemoryIndex:
         if not query:
             return []
         rows = self._match(query, limit)
-        if not rows and len(query) < 3:
+        if not rows:
+            # 兜底：trigram 对 <3 字/CJK 短语失效时退到 LIKE（仍有界）
             rows = self._like(query, limit)
+            if not rows:
+                for term in [t for t in re.split(r"\s+", query) if t]:
+                    rows = self._like(term, limit)
+                    if rows:
+                        break
         return rows
 
     def _match(self, query: str, limit: int) -> list[tuple[str, float]]:

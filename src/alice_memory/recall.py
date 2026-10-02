@@ -186,6 +186,12 @@ class RecallEngine:
         return top
 
     def _load_note(self, nid: str, meta: dict) -> Note:
+        # 优先按索引中记录的 path 直接读（O(1)），避免每个命中全量扫盘
+        path = meta.get("path")
+        if path:
+            note = self.store.read(path)
+            if note:
+                return note
         note = self.store.find_by_id(nid)
         if note:
             return note
