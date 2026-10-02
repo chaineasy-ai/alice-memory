@@ -192,10 +192,11 @@ class MemoryIndex:
             return []
         rows = self._match(query, limit)
         if not rows:
-            # 兜底：trigram 对 <3 字/CJK 短语失效 → unicode61 + 单字切分的 fts_cjk
-            rows = self._match_cjk(query, limit)
-        if not rows:
+            # curie iter3（A 级实测）：short CJK 用 LIKE 逐词 OR（R@1 0.671）
+            # 明显优于 CJK 单字切分（R@1 0.214）；故 LIKE 在前，fts_cjk 仅最后救命。
             rows = self._like(query, limit)
+        if not rows:
+            rows = self._match_cjk(query, limit)
         return rows
 
     def _match_cjk(self, query: str, limit: int) -> list[tuple[str, float]]:
