@@ -173,3 +173,22 @@ def test_bigram_tokenizer_spike(tmp_path):
     assert idx.search_fts("记忆 分层", 5)      # 多词 CJK
     assert idx.search_fts("memory 分层", 5)    # 混排
     idx.close()
+
+
+def test_tokenizer_mismatch_guard_g1(tmp_path):
+    """G1：索引 tokenizer 标识守卫——不 reindex 切 tokenizer 必须报错而非静默返回。"""
+    store = MemoryStore(tmp_path); store.init()
+    idx = MemoryIndex(store.indexdir / "index.sqlite", tokenizer="bigram")
+    MemoryManager(store, idx).add("记忆分层", "core/semantic")
+    assert idx.search_fts("记忆", 5)
+    idx.close()
+    idx2 = MemoryIndex(store.indexdir / "index.sqlite", tokenizer="trigram")
+    try:
+        idx2.search_fts("记忆", 5)
+        raise AssertionError("should raise on tokenizer mismatch")
+    except ValueError as e:
+        assert "tokenizer" in str(e)
+    # reindex 可切换
+    MemoryManager(store, idx2).reindex()
+    assert idx2.search_fts("记忆", 5)
+    idx2.close()

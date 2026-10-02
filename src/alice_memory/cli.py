@@ -249,10 +249,14 @@ def cmd_gc(store, index, mgr, recall, args):
 
 
 def cmd_reindex(store, index, mgr, recall, args):
+    tok = getattr(args, "lexical_tokenizer", None)
+    if tok and tok != index.tokenizer:
+        index.tokenizer = tok          # 允许 reindex 切换分词（meta 随之更新）
     if getattr(args, "embed", None):
         from .embed import get_embedder
         mgr.embedder = get_embedder(args.embed, model=args.embed_model or "none")
     return _emit("reindex", {"indexed": mgr.reindex(), "db": str(index.db_path),
+                             "tokenizer": index.tokenizer,
                              "vectors": sum(1 for _ in index.iter_vectors())})
 
 
@@ -397,6 +401,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--embed", choices=["none", "ollama", "local"], default=None,
                    help="重建时同时灌向量（hybrid 用）")
     r.add_argument("--embed-model", default=None)
+    r.add_argument("--lexical-tokenizer", choices=["trigram", "bigram"],
+                   default=argparse.SUPPRESS, help="重建时切换词法分词（trigram↔bigram）")
     _add_common_json(r); r.set_defaults(func=cmd_reindex)
     st = sub.add_parser("stats"); _add_common_json(st); st.set_defaults(func=cmd_stats)
 

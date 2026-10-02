@@ -36,6 +36,7 @@ CREATE INDEX IF NOT EXISTS idx_idem ON notes(idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_title_norm ON notes(title_norm);
 CREATE TABLE IF NOT EXISTS links (src TEXT, dst TEXT, PRIMARY KEY (src, dst));
 CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
 
@@ -74,6 +75,7 @@ class MemoryIndex:
         self.conn.row_factory = sqlite3.Row
         self._fts_tokenizer = "trigram"
         self.tokenizer = tokenizer if tokenizer in ("trigram", "bigram") else "trigram"
+        self._index_tokenizer = self.tokenizer
         self._setup()
 
     # -- schema -----------------------------------------------------------
@@ -101,12 +103,28 @@ class MemoryIndex:
             "id UNINDEXED, seg, tokenize='unicode61')"
         )
         self.conn.commit()
+        # G1：索引存 tokenizer 标识，供 mismatch 守卫
+        row = self.conn.execute("SELECT value FROM meta WHERE key='tokenizer'").fetchone()
+        if row and row["value"] in ("trigram", "bigram"):
+            self._index_tokenizer = row["value"]
+        else:
+            self._index_tokenizer = self.tokenizer
+            self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('tokenizer',?)",
+                              (self.tokenizer,))
+            self.conn.commit()
+
+    def _assert_tokenizer(self) -> None:
+        if self._index_tokenizer != self.tokenizer:
+            raise ValueError(
+                f"索引 tokenizer={self._index_tokenizer}，请求 {self.tokenizer}；"
+                f"请先 `mem reindex --lexical-tokenizer {self.tokenizer}`（索引可重建）")
 
     def close(self) -> None:
         self.conn.close()
 
     # -- 写 ---------------------------------------------------------------
     def upsert(self, note: Note, vector: Optional[list[float]] = None) -> None:
+        self._assert_tokenizer()
         meta = note.to_frontmatter()
         self.conn.execute(
             "INSERT OR REPLACE INTO notes (id,path,namespace,layer,type,title,status,body,"
@@ -157,6 +175,10 @@ class MemoryIndex:
         self.conn.commit()
 
     def reindex(self, notes: Iterable[Note], vectors: Optional[dict] = None) -> int:
+        # 允许通过 reindex 切换 tokenizer：先更新标识再重建
+        self._index_tokenizer = self.tokenizer
+        self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('tokenizer',?)", (self.tokenizer,))
+        self.conn.commit()
         self.clear()
         n = 0
         for note in notes:
@@ -203,6 +225,7 @@ class MemoryIndex:
 
     # -- 检索 -------------------------------------------------------------
     def search_fts(self, query: str, limit: int = 20) -> list[tuple[str, float]]:
+        self._assert_tokenizer()
         query = (query or "").strip()
         if not query:
             return []
