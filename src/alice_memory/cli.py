@@ -45,10 +45,10 @@ def _emit(cmd: str, payload: dict, exit_code: int = 0) -> int:
     return exit_code
 
 
-def _make(root: str, lock_timeout: float, embed_backend: str):
+def _make(root: str, lock_timeout: float, embed_backend: str, tokenizer: str = "trigram"):
     store = MemoryStore(root, lock_timeout=lock_timeout)
     store.init()
-    index = MemoryIndex(store.indexdir / "index.sqlite")
+    index = MemoryIndex(store.indexdir / "index.sqlite", tokenizer=tokenizer)
     embedder = get_embedder(embed_backend)
     return store, index, MemoryManager(store, index, embedder), RecallEngine(store, index, embedder)
 
@@ -275,6 +275,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="读写命名空间；写默认 $MEM_AGENT→agents/<id>，读默认全部")
     p.add_argument("--lock-timeout", type=float, default=5.0)
     p.add_argument("--embed", default="none", choices=["none", "ollama"])
+    p.add_argument("--lexical-tokenizer", default=os.environ.get("MEM_TOKENIZER", "trigram"),
+                   choices=["trigram", "bigram"], help="词法分词（v0 默认 trigram；bigram 为 #232 spike）")
     p.add_argument("--json", action="store_true", help="JSON 输出（默认即 JSON）")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -371,7 +373,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    store, index, mgr, recall = _make(args.root, args.lock_timeout, args.embed)
+    store, index, mgr, recall = _make(args.root, args.lock_timeout, args.embed, args.lexical_tokenizer)
     try:
         return args.func(store, index, mgr, recall, args)
     except TimeoutError as e:

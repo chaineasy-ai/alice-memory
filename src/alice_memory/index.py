@@ -62,12 +62,13 @@ def _unpack_vector(blob: Optional[bytes]) -> list[float]:
 
 
 class MemoryIndex:
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, tokenizer: str = "trigram"):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         self.conn.row_factory = sqlite3.Row
         self._fts_tokenizer = "trigram"
+        self.tokenizer = tokenizer if tokenizer in ("trigram", "bigram") else "trigram"
         self._setup()
 
     # -- schema -----------------------------------------------------------
@@ -87,6 +88,11 @@ class MemoryIndex:
         # CJK <3 字兜底：unicode61 + 单字切分（报告中 A 级实测过的方案）
         self.conn.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS fts_cjk USING fts5("
+            "id UNINDEXED, seg, tokenize='unicode61')"
+        )
+        # CJK 重叠 2-gram（#232 item4；unicode61 + 2-gram 切分），与 trigram 双建可切
+        self.conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_bi USING fts5("
             "id UNINDEXED, seg, tokenize='unicode61')"
         )
         self.conn.commit()
@@ -116,13 +122,17 @@ class MemoryIndex:
             ),
         )
         self.conn.execute("DELETE FROM fts WHERE id=?", (note.id,))
-        self.conn.execute(
-            "INSERT INTO fts (id,title,body,tags,entities) VALUES (?,?,?,?,?)",
-            (note.id, note.title, note.body, " ".join(note.tags), " ".join(note.entities)),
-        )
         self.conn.execute("DELETE FROM fts_cjk WHERE id=?", (note.id,))
-        seg = _cjk_seg(" ".join([note.title, note.body, " ".join(note.tags), " ".join(note.entities)]))
-        self.conn.execute("INSERT INTO fts_cjk (id,seg) VALUES (?,?)", (note.id, seg))
+        self.conn.execute("DELETE FROM fts_bi WHERE id=?", (note.id,))
+        flat = " ".join([note.title, note.body, " ".join(note.tags), " ".join(note.entities)])
+        if self.tokenizer == "bigram":
+            # 只填 active 分词表（索引可 rebuild），使体积可比
+            self.conn.execute("INSERT INTO fts_bi (id,seg) VALUES (?,?)", (note.id, _seg_bigram(flat)))
+        else:
+            self.conn.execute(
+                "INSERT INTO fts (id,title,body,tags,entities) VALUES (?,?,?,?,?)",
+                (note.id, note.title, note.body, " ".join(note.tags), " ".join(note.entities)))
+            self.conn.execute("INSERT INTO fts_cjk (id,seg) VALUES (?,?)", (note.id, _cjk_seg(flat)))
         self.conn.execute("DELETE FROM links WHERE src=?", (note.id,))
         for dst in note.links:
             self.conn.execute("INSERT OR IGNORE INTO links (src,dst) VALUES (?,?)", (note.id, dst))
@@ -132,12 +142,13 @@ class MemoryIndex:
         self.conn.execute("DELETE FROM notes WHERE id=?", (note_id,))
         self.conn.execute("DELETE FROM fts WHERE id=?", (note_id,))
         self.conn.execute("DELETE FROM fts_cjk WHERE id=?", (note_id,))
+        self.conn.execute("DELETE FROM fts_bi WHERE id=?", (note_id,))
         self.conn.execute("DELETE FROM links WHERE src=? OR dst=?", (note_id, note_id))
         self.conn.commit()
 
     def clear(self) -> None:
         self.conn.executescript(
-            "DELETE FROM notes; DELETE FROM fts; DELETE FROM fts_cjk; DELETE FROM links;")
+            "DELETE FROM notes; DELETE FROM fts; DELETE FROM fts_cjk; DELETE FROM fts_bi; DELETE FROM links;")
         self.conn.commit()
 
     def reindex(self, notes: Iterable[Note], vectors: Optional[dict] = None) -> int:
@@ -190,6 +201,11 @@ class MemoryIndex:
         query = (query or "").strip()
         if not query:
             return []
+        if self.tokenizer == "bigram":
+            rows = self._match_bi(query, limit)
+            if not rows:
+                rows = self._like(query, limit)
+            return rows
         rows = self._match(query, limit)
         if not rows:
             # curie iter3（A 级实测）：short CJK 用 LIKE 逐词 OR（R@1 0.671）
@@ -198,6 +214,20 @@ class MemoryIndex:
         if not rows:
             rows = self._match_cjk(query, limit)
         return rows
+
+    def _match_bi(self, query: str, limit: int) -> list[tuple[str, float]]:
+        # 与 curie iter6 一致：2-gram 之间做 OR（AND 对长查询过约束）
+        terms = list(dict.fromkeys(t for t in _seg_bigram(query).split() if t))
+        if not terms:
+            return []
+        match = " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
+        try:
+            cur = self.conn.execute(
+                "SELECT id, bm25(fts_bi) AS rank FROM fts_bi "
+                "WHERE fts_bi MATCH ? ORDER BY rank LIMIT ?", (match, limit))
+            return [(r["id"], 1.0 / (1.0 + abs(r["rank"]))) for r in cur]
+        except sqlite3.OperationalError:
+            return []
 
     def _match_cjk(self, query: str, limit: int) -> list[tuple[str, float]]:
         seg = _cjk_seg(query)
@@ -243,6 +273,18 @@ class MemoryIndex:
         sql = "SELECT id FROM notes WHERE " + " OR ".join(clauses) + " LIMIT ?"
         cur = self.conn.execute(sql, (*params, limit))
         return [(r["id"], 0.5) for r in cur]
+
+
+def _seg_bigram(text: str) -> str:
+    """CJK 重叠 2-gram（+ ascii 词）切分，供 fts_bi（unicode61）。"""
+    out: list[str] = []
+    for run in re.findall(r"[\u4e00-\u9fff]+", text or ""):
+        for i in range(len(run) - 1):
+            out.append(run[i:i + 2])
+        if len(run) == 1:
+            out.append(run)
+    out += re.findall(r"[a-z0-9_]+", (text or "").lower())
+    return " ".join(out)
 
 
 def _cjk_seg(text: str) -> str:

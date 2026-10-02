@@ -159,3 +159,17 @@ def test_concurrent_adds_same_namespace(tmp_path):
     store = MemoryStore(tmp_path)
     store.init()
     assert len(list(store.iter_notes())) == 6
+
+
+def test_bigram_tokenizer_spike(tmp_path):
+    """#232 item4：bigram 可切，2 字/多词 CJK 走 BM25（免 LIKE 兜底）。"""
+    store = MemoryStore(tmp_path)
+    store.init()
+    idx = MemoryIndex(store.indexdir / "index.sqlite", tokenizer="bigram")
+    mgr = MemoryManager(store, idx)
+    mgr.add("记忆分层设计", "core/semantic/episodic/entity/archive", tags=["memory"])
+    mgr.add("向量检索", "embedding retrieval fusion")
+    assert idx.search_fts("向量", 5)          # 2 字
+    assert idx.search_fts("记忆 分层", 5)      # 多词 CJK
+    assert idx.search_fts("memory 分层", 5)    # 混排
+    idx.close()
