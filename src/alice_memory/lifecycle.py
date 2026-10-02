@@ -78,6 +78,7 @@ class MemoryManager:
             source_type: str = "unknown", links=None, summary: str = "",
             owner: str = "", scope: str = "agent", domain: str = "",
             expires: Optional[str] = None, note_id: Optional[str] = None,
+            idempotency_key: Optional[str] = None,
             namespace: str = SHARED, dedup: bool = True, force: bool = False) -> WriteResult:
         ns = self.store.normalize_namespace(namespace)
         note = Note(
@@ -86,6 +87,7 @@ class MemoryManager:
             importance=importance, confidence=confidence, source=source,
             source_type=source_type, links=list(links or []), summary=summary,
             owner=owner, scope=scope, domain=domain, expires=expires,
+            idempotency_key=idempotency_key,
         )
         note.validate()
 
@@ -100,6 +102,13 @@ class MemoryManager:
         return WriteResult("added", note, message="新建")
 
     def _find_duplicate(self, note: Note) -> Optional[WriteResult]:
+        # I4：幂等键优先
+        if note.idempotency_key:
+            for existing_id in self.index.find_by_idempotency_key(note.idempotency_key):
+                old = self.store.find_by_id(existing_id)
+                if old:
+                    return WriteResult("duplicate", old, related=[existing_id],
+                                       message="幂等键命中，跳过")
         h = content_hash(note)
         for existing_id in self.index.find_by_content_hash(h):
             old = self.store.find_by_id(existing_id)

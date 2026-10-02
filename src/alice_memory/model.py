@@ -26,7 +26,7 @@ REQUIRED_FIELDS = ("id", "title", "type", "layer", "created", "updated", "status
 KNOWN_FIELDS = set(REQUIRED_FIELDS) | {
     "importance", "confidence", "last_accessed", "access_count", "tags", "entities",
     "links", "supersedes", "superseded_by", "expires", "source", "source_type",
-    "summary", "owner", "scope", "domain",
+    "summary", "owner", "scope", "domain", "idempotency_key",
 }
 
 
@@ -83,6 +83,7 @@ class Note:
     owner: str = ""
     scope: str = "agent"
     domain: str = ""
+    idempotency_key: Optional[str] = None
     path: Optional[str] = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -145,6 +146,7 @@ class Note:
             source=str(known.get("source") or ""), source_type=str(known.get("source_type") or "unknown"),
             summary=str(known.get("summary") or ""), owner=str(known.get("owner") or ""),
             scope=str(known.get("scope") or "agent"), domain=str(known.get("domain") or ""),
+            idempotency_key=known.get("idempotency_key"),
             path=path, extra={k: v for k, v in data.items()},
         )
 

@@ -26,11 +26,13 @@ CREATE TABLE IF NOT EXISTS notes (
     tags TEXT, entities TEXT, links TEXT,
     importance INTEGER, confidence REAL,
     source TEXT, source_type TEXT, domain TEXT, owner TEXT, scope TEXT,
+    idempotency_key TEXT,
     created TEXT, updated TEXT, last_accessed TEXT, access_count INTEGER,
     expires TEXT,
     vector BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_hash ON notes(content_hash);
+CREATE INDEX IF NOT EXISTS idx_idem ON notes(idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_title_norm ON notes(title_norm);
 CREATE TABLE IF NOT EXISTS links (src TEXT, dst TEXT, PRIMARY KEY (src, dst));
 CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst);
@@ -82,6 +84,11 @@ class MemoryIndex:
                 "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5("
                 "id UNINDEXED, title, body, tags, entities, tokenize='unicode61')"
             )
+        # CJK <3 字兜底：unicode61 + 单字切分（报告中 A 级实测过的方案）
+        self.conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_cjk USING fts5("
+            "id UNINDEXED, seg, tokenize='unicode61')"
+        )
         self.conn.commit()
 
     def close(self) -> None:
@@ -93,8 +100,8 @@ class MemoryIndex:
         self.conn.execute(
             "INSERT OR REPLACE INTO notes (id,path,namespace,layer,type,title,status,body,"
             "title_norm,content_hash,tags,entities,links,importance,confidence,source,"
-            "source_type,domain,owner,scope,created,updated,last_accessed,access_count,"
-            "expires,vector) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "source_type,domain,owner,scope,idempotency_key,created,updated,last_accessed,access_count,"
+            "expires,vector) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 note.id, note.path,
                 _namespace_from_path(note.path), note.layer, note.type, note.title,
@@ -102,7 +109,8 @@ class MemoryIndex:
                 normalize_title(note.title), content_hash(note),
                 " ".join(note.tags), " ".join(note.entities), " ".join(note.links),
                 note.importance, note.confidence, note.source, note.source_type,
-                note.domain, note.owner, note.scope, note.created, note.updated,
+                note.domain, note.owner, note.scope, note.idempotency_key,
+                note.created, note.updated,
                 note.last_accessed or "", note.access_count or 0, note.expires or "",
                 _pack_vector(vector),
             ),
@@ -112,6 +120,9 @@ class MemoryIndex:
             "INSERT INTO fts (id,title,body,tags,entities) VALUES (?,?,?,?,?)",
             (note.id, note.title, note.body, " ".join(note.tags), " ".join(note.entities)),
         )
+        self.conn.execute("DELETE FROM fts_cjk WHERE id=?", (note.id,))
+        seg = _cjk_seg(" ".join([note.title, note.body, " ".join(note.tags), " ".join(note.entities)]))
+        self.conn.execute("INSERT INTO fts_cjk (id,seg) VALUES (?,?)", (note.id, seg))
         self.conn.execute("DELETE FROM links WHERE src=?", (note.id,))
         for dst in note.links:
             self.conn.execute("INSERT OR IGNORE INTO links (src,dst) VALUES (?,?)", (note.id, dst))
@@ -120,11 +131,13 @@ class MemoryIndex:
     def remove(self, note_id: str) -> None:
         self.conn.execute("DELETE FROM notes WHERE id=?", (note_id,))
         self.conn.execute("DELETE FROM fts WHERE id=?", (note_id,))
+        self.conn.execute("DELETE FROM fts_cjk WHERE id=?", (note_id,))
         self.conn.execute("DELETE FROM links WHERE src=? OR dst=?", (note_id, note_id))
         self.conn.commit()
 
     def clear(self) -> None:
-        self.conn.executescript("DELETE FROM notes; DELETE FROM fts; DELETE FROM links;")
+        self.conn.executescript(
+            "DELETE FROM notes; DELETE FROM fts; DELETE FROM fts_cjk; DELETE FROM links;")
         self.conn.commit()
 
     def reindex(self, notes: Iterable[Note], vectors: Optional[dict] = None) -> int:
@@ -147,6 +160,10 @@ class MemoryIndex:
     def find_by_title(self, normalized_title: str) -> list[str]:
         return [r["id"] for r in self.conn.execute(
             "SELECT id FROM notes WHERE title_norm=?", (normalized_title,))]
+
+    def find_by_idempotency_key(self, key: str) -> list[str]:
+        return [r["id"] for r in self.conn.execute(
+            "SELECT id FROM notes WHERE idempotency_key=?", (key,))]
 
     def iter_vectors(self):
         for r in self.conn.execute("SELECT id, vector FROM notes WHERE vector IS NOT NULL"):
@@ -175,14 +192,27 @@ class MemoryIndex:
             return []
         rows = self._match(query, limit)
         if not rows:
-            # 兜底：trigram 对 <3 字/CJK 短语失效时退到 LIKE（仍有界）
+            # 兜底：trigram 对 <3 字/CJK 短语失效 → unicode61 + 单字切分的 fts_cjk
+            rows = self._match_cjk(query, limit)
+        if not rows:
             rows = self._like(query, limit)
-            if not rows:
-                for term in [t for t in re.split(r"\s+", query) if t]:
-                    rows = self._like(term, limit)
-                    if rows:
-                        break
         return rows
+
+    def _match_cjk(self, query: str, limit: int) -> list[tuple[str, float]]:
+        seg = _cjk_seg(query)
+        terms = [t for t in seg.split() if t]
+        if not terms:
+            return []
+        match = " AND ".join('"' + t.replace('"', '""') + '"' for t in terms)
+        try:
+            cur = self.conn.execute(
+                "SELECT g.id, bm25(fts_cjk) AS rank FROM fts_cjk g "
+                "WHERE g MATCH ? ORDER BY rank LIMIT ?",
+                (match, limit),
+            )
+            return [(r["id"], 1.0 / (1.0 + abs(r["rank"]))) for r in cur]
+        except sqlite3.OperationalError:
+            return []
 
     def _match(self, query: str, limit: int) -> list[tuple[str, float]]:
         terms = [t for t in re.split(r"\s+", query) if t]
@@ -209,6 +239,17 @@ class MemoryIndex:
             (pat, pat, pat, pat, limit),
         )
         return [(r["id"], 0.5) for r in cur]
+
+
+def _cjk_seg(text: str) -> str:
+    """把 CJK 字符拆成单字（空格分隔），ASCII 保留——供 unicode61 FTS 索引/查询。"""
+    out = []
+    for ch in text or "":
+        if "\u4e00" <= ch <= "\u9fff":
+            out.append(f" {ch} ")
+        else:
+            out.append(ch)
+    return re.sub(r"\s+", " ", "".join(out)).strip()
 
 
 def _namespace_from_path(path: Optional[str]) -> str:

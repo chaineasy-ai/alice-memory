@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -85,32 +86,44 @@ def cmd_add(store, index, mgr, recall, args):
                   source_type=args.source_type, links=args.link, summary=args.summary,
                   owner=args.owner, scope=args.scope, domain=args.domain,
                   expires=args.expires, note_id=args.id,
+                  idempotency_key=args.idempotency_key,
                   namespace=ns, force=args.force)
     return _emit("add", {"event": res.status, "message": res.message,
                          "related": res.related, "note": _note_json(res.note)})
 
 
 def cmd_search(store, index, mgr, recall, args):
-    mode = "lexical" if args.mode == "auto" and not any(index.iter_vectors()) else args.mode
+    requested = args.mode
+    degraded = False
+    if requested == "hybrid":
+        if recall.embedder.name == "none" or not any(True for _ in index.iter_vectors()):
+            degraded = True
     hits = recall.search(args.query, k=args.k, mode=args.mode, layer=args.layer,
                          type=args.type, tags=args.tags, namespace=args.namespace,
-                         include_archived=args.include_archived, touch=args.touch)
+                         include_archived=args.include_archived, touch=False)
+    actual = "lexical" if (degraded or requested == "lexical" or not any(
+        True for _ in index.iter_vectors())) else requested
     results = [{
         "id": h.note.id, "score": h.score, "path": h.note.path, "title": h.note.title,
         "layer": h.note.layer, "namespace": _ns(h.note.path),
         "snippet": (h.note.body or "")[:120].replace("\n", " "),
         "why": h.reason or "lexical", "components": h.components,
     } for h in hits]
-    out: dict[str, Any] = {"mode": mode, "count": len(results), "results": results}
+    out: dict[str, Any] = {"mode": actual, "count": len(results), "results": results,
+                           "degraded": degraded}
     if args.context:
-        out["context"] = recall.context(args.query, token_budget=args.budget_tokens, k=args.k)
-    return _emit("search", out)
+        out["context"] = recall.context(args.query, token_budget=args.budget_tokens, k=args.k,
+                                        budget_unit=args.budget_unit)
+    if args.touch and hits:
+        from datetime import datetime, timezone
+        recall._touch(hits, datetime.now(timezone.utc).astimezone())
+    return _emit("search", out, 6 if degraded else 0)
 
 
 def cmd_get(store, index, mgr, recall, args):
     note = store.find_by_id(args.id)
     if not note:
-        return _emit("get", {"error": f"未找到记忆: {args.id}"}, 1)
+        return _emit("get", {"error": f"未找到记忆: {args.id}"}, 3)
     return _emit("get", {"note": _note_json(note)})
 
 
@@ -129,7 +142,7 @@ def cmd_update(store, index, mgr, recall, args):
                           status=args.status, source=args.source, summary=args.summary,
                           layer=args.layer)
     except KeyError as e:
-        return _emit("update", {"error": str(e)}, 1)
+        return _emit("update", {"error": str(e)}, 3)
     return _emit("update", {"note": _note_json(note)})
 
 
@@ -137,7 +150,7 @@ def cmd_link(store, index, mgr, recall, args):
     try:
         note = mgr.link(args.id, args.to_id, unlink=args.unlink)
     except KeyError as e:
-        return _emit("link", {"error": str(e)}, 1)
+        return _emit("link", {"error": str(e)}, 3)
     return _emit("link", {"id": note.id, "links": note.links, "unlinked": args.unlink})
 
 
@@ -157,18 +170,26 @@ def cmd_stats(store, index, mgr, recall, args):
     notes = list(store.iter_notes())
     by_layer: dict[str, int] = {}
     by_ns: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    links = 0
     for n in notes:
         by_layer[n.layer] = by_layer.get(n.layer, 0) + 1
         by_ns[_ns(n.path)] = by_ns.get(_ns(n.path), 0) + 1
-    return _emit("stats", {"total": len(notes), "indexed": index.count(),
-                           "by_layer": by_layer, "by_namespace": by_ns,
-                           "active": sum(1 for n in notes if n.status == "active"),
-                           "archived": sum(1 for n in notes if n.status == "archived")})
+        by_status[n.status] = by_status.get(n.status, 0) + 1
+        links += len(n.links)
+    vectors = sum(1 for _ in index.iter_vectors())
+    gc_candidates = len(mgr.gc_candidates())
+    # I5：固定字段（空值给 0/{}，不省略）
+    return _emit("stats", {"total": len(notes), "by_namespace": by_ns,
+                           "by_layer": by_layer, "by_status": by_status,
+                           "gc_candidates": gc_candidates, "index_schema": "mem.index.v1",
+                           "vectors": vectors, "links": links})
 
 
 def cmd_context(store, index, mgr, recall, args):
-    text = recall.context(args.query, token_budget=args.budget_tokens, k=args.k)
-    return _emit("context", {"context": text, "tokens": __import__("alice_memory.recall", fromlist=["estimate_tokens"]).estimate_tokens(text)})
+    text = recall.context(args.query, token_budget=args.budget_tokens, k=args.k,
+                          budget_unit=args.budget_unit)
+    return _emit("context", {"context": text, "budget_unit": args.budget_unit})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -203,6 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--domain", default="")
     a.add_argument("--expires")
     a.add_argument("--id")
+    a.add_argument("--idempotency-key")
     a.add_argument("--namespace")
     a.add_argument("--force", action="store_true")
     a.set_defaults(func=cmd_add)
@@ -216,6 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--layer"); s.add_argument("--type")
     s.add_argument("--tags", nargs="*", default=[])
     s.add_argument("--budget-tokens", type=int, default=2000)
+    s.add_argument("--budget-unit", default="tokens", choices=["tokens", "chars"])
     s.add_argument("--context", action="store_true")
     s.add_argument("--namespace")
     s.add_argument("--include-archived", action="store_true")
@@ -250,6 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("context")
     c.add_argument("query"); c.add_argument("--k", type=int, default=10)
     c.add_argument("--budget-tokens", type=int, default=2000)
+    c.add_argument("--budget-unit", default="tokens", choices=["tokens", "chars"])
     c.set_defaults(func=cmd_context)
     return p
 
@@ -259,6 +283,12 @@ def main(argv=None) -> int:
     store, index, mgr, recall = _make(args.root, args.lock_timeout, args.embed)
     try:
         return args.func(store, index, mgr, recall, args)
+    except TimeoutError as e:
+        print(json.dumps({"schema_version": "mem.error.v1", "error": str(e), "code": 4}, ensure_ascii=False))
+        return 4
+    except (OSError, sqlite3.Error) as e:
+        print(json.dumps({"schema_version": "mem.error.v1", "error": str(e), "code": 5}, ensure_ascii=False))
+        return 5
     finally:
         index.close()
 

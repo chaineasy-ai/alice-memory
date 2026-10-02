@@ -174,16 +174,24 @@ class RecallEngine:
             c = self.config
             score = c.w_rel * rel + c.w_rec * rec + c.w_imp * imp + c.w_graph * graph
             scored.append(ScoredNote(
-                note=self._load_note(nid, meta), score=round(score, 6),
+                note=self._meta_note(meta), score=round(score, 6),
                 components={"rel": round(rel, 4), "recency": round(rec, 4),
                             "importance": round(imp, 4), "graph": graph},
                 reason="linked" if graph else "",
             ))
         scored.sort(key=lambda s: s.score, reverse=True)
         top = scored[:k]
+        # 只为最终 top-k 读盘（评分只用元数据）
+        for s in top:
+            s.note = self._load_note(s.note.id, self.index.get_meta(s.note.id) or {})
         if touch:
             self._touch(top, now)
         return top
+
+    @staticmethod
+    def _meta_note(meta: dict) -> Note:
+        return Note(id=meta["id"], title=meta.get("title") or "",
+                    layer=meta.get("layer") or "semantic", path=meta.get("path"))
 
     def _load_note(self, nid: str, meta: dict) -> Note:
         # 优先按索引中记录的 path 直接读（O(1)），避免每个命中全量扫盘
@@ -218,7 +226,10 @@ class RecallEngine:
 
     # -- 上下文装配 -------------------------------------------------------
     def context(self, query: str, token_budget: int = 2000, k: int = 10,
-                mode: str = "auto", include_core: bool = True) -> str:
+                mode: str = "auto", include_core: bool = True,
+                budget_unit: str = "tokens") -> str:
+        def cost_of(text: str) -> int:
+            return len(text) if budget_unit == "chars" else estimate_tokens(text)
         sections: list[str] = []
         used = 0
         if include_core:
@@ -226,27 +237,28 @@ class RecallEngine:
             core.sort(key=lambda n: n.importance, reverse=True)
             if core:
                 block = self._render_block("核心记忆（常驻）", core)
-                used += estimate_tokens(block)
+                used += cost_of(block)
                 sections.append(block)
         hits = self.search(query, k=k, mode=mode, touch=True)
+        # I2：确定性排序 score desc, id asc
+        hits = sorted(hits, key=lambda h: (-h.score, h.note.id))
         picked = []
         for hit in hits:
-            cost = estimate_tokens(self._render_note(hit.note))
+            cost = cost_of(self._render_note(hit.note))
             if used + cost > token_budget and picked:
                 break
             picked.append(hit.note)
             used += cost
         if picked:
             sections.append(self._render_block("相关记忆（检索）", picked))
-        return "\n\n".join(sections) if sections else "（无相关记忆）"
+        return "\n\n".join(sections) if sections else ""
 
     @staticmethod
     def _render_note(note: Note) -> str:
-        head = f"### {note.title}\n"
-        meta = f"> id={note.id} layer={note.layer} importance={note.importance}"
-        if note.source:
-            meta += f" source={note.source}"
-        return head + meta + "\n\n" + (note.body or "").strip() + "\n"
+        # I2：确定性分隔头（集成层可解析）；排序由 context 保证
+        head = (f"<!-- mem: id={note.id} layer={note.layer} "
+                f"source={note.source or ''} -->\n### {note.title}\n")
+        return head + (note.body or "").strip() + "\n"
 
     @classmethod
     def _render_block(cls, title: str, notes: list[Note]) -> str:

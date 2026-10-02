@@ -59,3 +59,34 @@ def test_cli_shared_namespace(tmp_path):
     # 另一 agent（读全部命名空间）能看到共享层
     res = mem(tmp_path, "search", "shared fact", as_agent="curie")
     assert res["count"] >= 1
+
+
+def test_stats_fixed_fields_i5(tmp_path):
+    mem(tmp_path, "add", "--title", "a", "--text", "b")
+    st = mem(tmp_path, "stats")
+    assert st["schema_version"] == "mem.stats.v1"
+    for k in ("total", "by_namespace", "by_layer", "by_status", "gc_candidates",
+              "index_schema", "vectors", "links"):
+        assert k in st, k
+
+
+def test_idempotency_key_i4(tmp_path):
+    a = mem(tmp_path, "add", "--title", "evt", "--text", "v1", "--idempotency-key", "K1")
+    b = mem(tmp_path, "add", "--title", "evt", "--text", "v2", "--idempotency-key", "K1")
+    assert a["event"] == "added" and b["event"] == "duplicate"
+    assert a["note"]["id"] == b["note"]["id"]
+
+
+def test_context_delimiter_i2(tmp_path):
+    mem(tmp_path, "add", "--title", "检索设计", "--text", "FTS5 trigram 词法检索",
+        "--source", "docs/x.md")
+    res = mem(tmp_path, "search", "trigram", "--context", "--budget-tokens", "500")
+    assert "<!-- mem: id=" in res["context"]
+    assert "source=docs/x.md" in res["context"]
+
+
+def test_exit_code_not_found_i3(tmp_path):
+    p = subprocess.run([sys.executable, "-m", "alice_memory", "get", "nope"],
+                       env={**os.environ, "PYTHONPATH": str(REPO / "src"),
+                            "MEM_HOME": str(tmp_path)}, capture_output=True, text=True)
+    assert p.returncode == 3
