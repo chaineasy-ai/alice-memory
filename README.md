@@ -104,13 +104,23 @@ mem stats
 ## 7. 测试 / 复现
 
 ```bash
-PYTHONPATH=src python3 -m pytest tests/ -q     # 13 项：模型/存储/索引/生命周期/召回/并发
+PYTHONPATH=src python3 -m pytest tests/ -q     # 20 项：模型/存储/索引/生命周期/召回/CLI/并发/§4.8
 ./bootstrap.sh test                            # 同上（封装）
 ```
 
 实测环境：Python 3.13 + SQLite（FTS5 trigram 可用）、零付费、无外部服务。
+500 语料 lexical 召回 p50 11.9ms。
 
-## 8. 局限（诚实标注）
+## 8. 集成契约（§4.8）
+
+- **I1 读不回写**：`search` 默认不更新 `last_accessed/access_count`；`--touch` 才 best-effort。
+- **I2 context**：确定性文本块，固定分隔头 `<!-- mem: id=<id> layer=<layer> source=<source> -->`；
+  稳定排序（score desc, id asc）；`--budget-tokens N` / `--budget-unit tokens|chars`；无命中降为空串（不报错）。
+- **I3 退出码**：`0` 成功 ｜ `2` 参数错 ｜ `3` 未找到 ｜ `4` 锁超时 ｜ `5` IO/索引错 ｜ `6` 降级（hybrid→lexical，仍返回结果）。
+- **I4 幂等**：`add` 默认内容 hash NOOP；`--idempotency-key K` 存入 frontmatter，同 K 重放 → NOOP 并回既有 id。
+- **I5 stats**：`mem stats --json` 固定字段 `total/by_namespace/by_layer/by_status/gc_candidates/index_schema/vectors/links`。
+
+## 9. 局限（诚实标注）
 
 - 只实现 **v0 lexical**；`hybrid` 已留接口，向量后端（Ollama bge-m3）**待本机服务启动后验证**。
 - SQLite FTS5 **trigram 对 <3 字查询失效**（已用 LIKE 兜底，未做 CJK 单字切分索引）；
