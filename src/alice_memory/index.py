@@ -1,0 +1,212 @@
+"""派生索引 MemoryIndex：SQLite FTS5(trigram+BM25) + 元数据 + 链接邻接表。
+
+契约 §4.6-D1：`.md` 是唯一真源，本索引全部派生、可删除后 `reindex` 重建。
+v0 检索 = FTS5 trigram + BM25（不手搓 grep）；<3 字 CJK 查询用 LIKE 兜底
+（trigram 对 2 字/单字失效，见 §3.2）。
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sqlite3
+import struct
+from pathlib import Path
+from typing import Iterable, Optional
+
+from .model import Note, normalize_title
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS notes (
+    id TEXT PRIMARY KEY,
+    path TEXT,
+    namespace TEXT,
+    layer TEXT, type TEXT, title TEXT, status TEXT, body TEXT,
+    title_norm TEXT, content_hash TEXT,
+    tags TEXT, entities TEXT, links TEXT,
+    importance INTEGER, confidence REAL,
+    source TEXT, source_type TEXT, domain TEXT, owner TEXT, scope TEXT,
+    created TEXT, updated TEXT, last_accessed TEXT, access_count INTEGER,
+    expires TEXT,
+    vector BLOB
+);
+CREATE INDEX IF NOT EXISTS idx_hash ON notes(content_hash);
+CREATE INDEX IF NOT EXISTS idx_title_norm ON notes(title_norm);
+CREATE TABLE IF NOT EXISTS links (src TEXT, dst TEXT, PRIMARY KEY (src, dst));
+CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst);
+"""
+
+
+def content_hash(note_or_text) -> str:
+    """内容指纹：标题+正文的 md5（mem0 式去重）。接受 Note 或 str。"""
+    if isinstance(note_or_text, Note):
+        text = f"{note_or_text.title}\n{note_or_text.body}"
+    else:
+        text = str(note_or_text)
+    return hashlib.md5(text.strip().encode("utf-8")).hexdigest()
+
+
+def _pack_vector(vec: Optional[list[float]]) -> Optional[bytes]:
+    if not vec:
+        return None
+    return struct.pack(f"<{len(vec)}f", *[float(x) for x in vec])
+
+
+def _unpack_vector(blob: Optional[bytes]) -> list[float]:
+    if not blob:
+        return []
+    n = len(blob) // 4
+    return list(struct.unpack(f"<{n}f", blob))
+
+
+class MemoryIndex:
+    def __init__(self, db_path: str | Path):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+        self.conn.row_factory = sqlite3.Row
+        self._fts_tokenizer = "trigram"
+        self._setup()
+
+    # -- schema -----------------------------------------------------------
+    def _setup(self) -> None:
+        self.conn.executescript(_SCHEMA)
+        try:
+            self.conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5("
+                "id UNINDEXED, title, body, tags, entities, tokenize='trigram')"
+            )
+        except sqlite3.OperationalError:
+            self._fts_tokenizer = "unicode61"
+            self.conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5("
+                "id UNINDEXED, title, body, tags, entities, tokenize='unicode61')"
+            )
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    # -- 写 ---------------------------------------------------------------
+    def upsert(self, note: Note, vector: Optional[list[float]] = None) -> None:
+        meta = note.to_frontmatter()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO notes (id,path,namespace,layer,type,title,status,body,"
+            "title_norm,content_hash,tags,entities,links,importance,confidence,source,"
+            "source_type,domain,owner,scope,created,updated,last_accessed,access_count,"
+            "expires,vector) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                note.id, note.path,
+                _namespace_from_path(note.path), note.layer, note.type, note.title,
+                note.status, note.body,
+                normalize_title(note.title), content_hash(note),
+                " ".join(note.tags), " ".join(note.entities), " ".join(note.links),
+                note.importance, note.confidence, note.source, note.source_type,
+                note.domain, note.owner, note.scope, note.created, note.updated,
+                note.last_accessed or "", note.access_count or 0, note.expires or "",
+                _pack_vector(vector),
+            ),
+        )
+        self.conn.execute("DELETE FROM fts WHERE id=?", (note.id,))
+        self.conn.execute(
+            "INSERT INTO fts (id,title,body,tags,entities) VALUES (?,?,?,?,?)",
+            (note.id, note.title, note.body, " ".join(note.tags), " ".join(note.entities)),
+        )
+        self.conn.execute("DELETE FROM links WHERE src=?", (note.id,))
+        for dst in note.links:
+            self.conn.execute("INSERT OR IGNORE INTO links (src,dst) VALUES (?,?)", (note.id, dst))
+        self.conn.commit()
+
+    def remove(self, note_id: str) -> None:
+        self.conn.execute("DELETE FROM notes WHERE id=?", (note_id,))
+        self.conn.execute("DELETE FROM fts WHERE id=?", (note_id,))
+        self.conn.execute("DELETE FROM links WHERE src=? OR dst=?", (note_id, note_id))
+        self.conn.commit()
+
+    def clear(self) -> None:
+        self.conn.executescript("DELETE FROM notes; DELETE FROM fts; DELETE FROM links;")
+        self.conn.commit()
+
+    def reindex(self, notes: Iterable[Note], vectors: Optional[dict] = None) -> int:
+        self.clear()
+        n = 0
+        for note in notes:
+            vec = (vectors or {}).get(note.id)
+            self.upsert(note, vector=vec)
+            n += 1
+        return n
+
+    # -- 读 ---------------------------------------------------------------
+    def get_meta(self, note_id: str) -> Optional[dict]:
+        row = self.conn.execute("SELECT * FROM notes WHERE id=?", (note_id,)).fetchone()
+        return dict(row) if row else None
+
+    def find_by_content_hash(self, h: str) -> list[str]:
+        return [r["id"] for r in self.conn.execute("SELECT id FROM notes WHERE content_hash=?", (h,))]
+
+    def find_by_title(self, normalized_title: str) -> list[str]:
+        return [r["id"] for r in self.conn.execute(
+            "SELECT id FROM notes WHERE title_norm=?", (normalized_title,))]
+
+    def iter_vectors(self):
+        for r in self.conn.execute("SELECT id, vector FROM notes WHERE vector IS NOT NULL"):
+            v = _unpack_vector(r["vector"])
+            if v:
+                yield r["id"], v
+
+    def neighbors(self, note_id: str, direction: str = "out") -> list[str]:
+        if direction == "out":
+            rows = self.conn.execute("SELECT dst FROM links WHERE src=?", (note_id,))
+        elif direction == "in":
+            rows = self.conn.execute("SELECT src FROM links WHERE dst=?", (note_id,))
+        else:
+            rows = self.conn.execute(
+                "SELECT dst AS x FROM links WHERE src=? UNION SELECT src FROM links WHERE dst=?",
+                (note_id, note_id))
+        return [r[0] for r in rows]
+
+    def count(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+
+    # -- 检索 -------------------------------------------------------------
+    def search_fts(self, query: str, limit: int = 20) -> list[tuple[str, float]]:
+        query = (query or "").strip()
+        if not query:
+            return []
+        rows = self._match(query, limit)
+        if not rows and len(query) < 3:
+            rows = self._like(query, limit)
+        return rows
+
+    def _match(self, query: str, limit: int) -> list[tuple[str, float]]:
+        terms = [t for t in re.split(r"\s+", query) if t]
+        if not terms:
+            return []
+        match = " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
+        try:
+            cur = self.conn.execute(
+                "SELECT f.id, bm25(fts) AS rank FROM fts f "
+                "JOIN notes n ON n.id=f.id "
+                "WHERE fts MATCH ? ORDER BY rank LIMIT ?",
+                (match, limit),
+            )
+            # bm25() 越小越相关 -> 转成越大越好
+            return [(r["id"], 1.0 / (1.0 + abs(r["rank"]))) for r in cur]
+        except sqlite3.OperationalError:
+            return []
+
+    def _like(self, query: str, limit: int) -> list[tuple[str, float]]:
+        pat = f"%{query}%"
+        cur = self.conn.execute(
+            "SELECT id FROM notes WHERE title LIKE ? OR body LIKE ? OR tags LIKE ? "
+            "OR entities LIKE ? LIMIT ?",
+            (pat, pat, pat, pat, limit),
+        )
+        return [(r["id"], 0.5) for r in cur]
+
+
+def _namespace_from_path(path: Optional[str]) -> str:
+    if not path:
+        return "shared"
+    m = re.search(r"/memory/agents/([^/]+)/", str(path))
+    return f"agents/{m.group(1)}" if m else "shared"

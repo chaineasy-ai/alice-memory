@@ -1,0 +1,26 @@
+[project]
+name = "alice-memory"
+version = "0.1.0"
+description = "C-Land markdown 形式的记忆系统（mem CLI）：文件即记忆 + 混合检索 + 生命周期"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+# 可选：本地向量检索。默认实现用纯 Python/NumPy 计算余弦，numpy 缺失时自动降级。
+vector = ["numpy>=1.26"]
+
+[project.scripts]
+mem = "alice_memory.cli:main"
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "e2e"]
