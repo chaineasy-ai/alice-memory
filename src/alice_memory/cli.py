@@ -317,6 +317,9 @@ def cmd_context(store, index, mgr, recall, args):
 def _add_common_json(p):
     p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                    help="JSON 输出（默认即 JSON；仅为契约兼容接受）")
+    p.add_argument("--lexical-tokenizer", choices=["trigram", "bigram"],
+                   default=argparse.SUPPRESS,
+                   help="词法分词（顶层/子命令均可；默认 $MEM_TOKENIZER→bigram）")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -415,8 +418,6 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--embed", choices=["none", "ollama", "local"], default=None,
                    help="重建时同时灌向量（hybrid 用）")
     r.add_argument("--embed-model", default=None)
-    r.add_argument("--lexical-tokenizer", choices=["trigram", "bigram"],
-                   default=argparse.SUPPRESS, help="重建时切换词法分词（trigram↔bigram）")
     _add_common_json(r); r.set_defaults(func=cmd_reindex)
     st = sub.add_parser("stats"); _add_common_json(st); st.set_defaults(func=cmd_stats)
 
