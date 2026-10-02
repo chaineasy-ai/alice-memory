@@ -90,3 +90,49 @@ def test_exit_code_not_found_i3(tmp_path):
                        env={**os.environ, "PYTHONPATH": str(REPO / "src"),
                             "MEM_HOME": str(tmp_path)}, capture_output=True, text=True)
     assert p.returncode == 3
+
+
+def test_contract_cli_forms_ci034(tmp_path):
+    """CI-034 护栏：§4.6 文档化的调用形式必须逐条成功（防止契约-实现漂移）。"""
+    # add <title> [body] ... 位置参数 + 子命令后 --json
+    add = mem(tmp_path, "add", "记忆分层设计", "core/semantic/episodic", "--layer", "semantic",
+              "--type", "note", "--tags", "memory,design", "--importance", "8",
+              "--source", "base/cland-crawler#230", "--source-type", "issue", "--json")
+    mid = add["note"]["id"]
+    assert add["schema_version"] == "mem.add.v1"
+
+    add2 = mem(tmp_path, "add", "第二篇", "--link", mid, "--summary", "摘要", "--json")
+    mid2 = add2["note"]["id"]
+
+    # search "<query>" -k N --layer --tag --mode lexical --all --json
+    res = mem(tmp_path, "search", "记忆 分层", "-k", "5", "--layer", "semantic",
+              "--tag", "memory", "--mode", "lexical", "--all", "--json")
+    assert res["schema_version"] == "mem.search.v1"
+    assert res["count"] >= 1, res          # B1 修复后多词 CJK 应命中
+    r0 = res["results"][0]
+    assert set(r0["why"]) == {"rel", "recency", "importance", "graph"}
+    assert "source" in r0
+
+    # get <id> --json
+    assert mem(tmp_path, "get", mid, "--json")["note"]["id"] == mid
+
+    # update <id> --title --body --add-tag a,b --importance --status --source
+    up = mem(tmp_path, "update", mid2, "--title", "第二篇改名", "--body", "新正文",
+             "--add-tag", "a,b", "--importance", "6", "--status", "active",
+             "--source", "x", "--json")
+    assert up["schema_version"] == "mem.update.v1"
+    assert "a" in up["note"]["tags"] and "b" in up["note"]["tags"]
+
+    # link <id> <to-id>
+    assert mem(tmp_path, "link", mid, mid2, "--json")["id"] == mid
+
+    # gc --apply --stale-days 180 --min-importance 2 --json
+    gc = mem(tmp_path, "gc", "--stale-days", "180", "--min-importance", "2", "--json")
+    assert gc["schema_version"] == "mem.gc.v1" and gc["dry_run"] is True
+
+    # reindex / stats / context
+    assert mem(tmp_path, "reindex", "--json")["schema_version"] == "mem.reindex.v1"
+    assert mem(tmp_path, "stats", "--json")["schema_version"] == "mem.stats.v1"
+    ctx = mem(tmp_path, "context", "记忆分层", "--budget", "2000",
+              "--budget-unit", "tokens", "-k", "5", "--json")
+    assert ctx["schema_version"] == "mem.context.v1"

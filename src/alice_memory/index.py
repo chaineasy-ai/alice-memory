@@ -206,8 +206,8 @@ class MemoryIndex:
         match = " AND ".join('"' + t.replace('"', '""') + '"' for t in terms)
         try:
             cur = self.conn.execute(
-                "SELECT g.id, bm25(fts_cjk) AS rank FROM fts_cjk g "
-                "WHERE g MATCH ? ORDER BY rank LIMIT ?",
+                "SELECT id, bm25(fts_cjk) AS rank FROM fts_cjk "
+                "WHERE fts_cjk MATCH ? ORDER BY rank LIMIT ?",
                 (match, limit),
             )
             return [(r["id"], 1.0 / (1.0 + abs(r["rank"]))) for r in cur]
@@ -232,12 +232,15 @@ class MemoryIndex:
             return []
 
     def _like(self, query: str, limit: int) -> list[tuple[str, float]]:
-        pat = f"%{query}%"
-        cur = self.conn.execute(
-            "SELECT id FROM notes WHERE title LIKE ? OR body LIKE ? OR tags LIKE ? "
-            "OR entities LIKE ? LIMIT ?",
-            (pat, pat, pat, pat, limit),
-        )
+        # 按词拆分做 OR（整串 LIKE 对多词查询必然 0 命中）
+        terms = [t for t in re.split(r"\s+", query) if t] or [query]
+        clauses, params = [], []
+        for t in terms:
+            pat = f"%{t}%"
+            clauses.append("(title LIKE ? OR body LIKE ? OR tags LIKE ? OR entities LIKE ?)")
+            params += [pat, pat, pat, pat]
+        sql = "SELECT id FROM notes WHERE " + " OR ".join(clauses) + " LIMIT ?"
+        cur = self.conn.execute(sql, (*params, limit))
         return [(r["id"], 0.5) for r in cur]
 
 

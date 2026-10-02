@@ -226,8 +226,8 @@ class RecallEngine:
 
     # -- 上下文装配 -------------------------------------------------------
     def context(self, query: str, token_budget: int = 2000, k: int = 10,
-                mode: str = "auto", include_core: bool = True,
-                budget_unit: str = "tokens") -> str:
+                mode: str = "lexical", include_core: bool = True,
+                budget_unit: str = "tokens", touch: bool = False) -> str:
         def cost_of(text: str) -> int:
             return len(text) if budget_unit == "chars" else estimate_tokens(text)
         sections: list[str] = []
@@ -239,7 +239,8 @@ class RecallEngine:
                 block = self._render_block("核心记忆（常驻）", core)
                 used += cost_of(block)
                 sections.append(block)
-        hits = self.search(query, k=k, mode=mode, touch=True)
+        # I1：context 默认只读，不 touch（--touch 显式才写）
+        hits = self.search(query, k=k, mode=mode, touch=touch)
         # I2：确定性排序 score desc, id asc
         hits = sorted(hits, key=lambda h: (-h.score, h.note.id))
         picked = []
