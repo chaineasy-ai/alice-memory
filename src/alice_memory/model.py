@@ -43,6 +43,24 @@ def parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def normalize_confidence(value):
+    """R448：confidence 校验前归一化（high/medium/low → 0.9/0.6/0.3；非法报错）。"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"confidence 非法: {value!r}")
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().lower()
+    table = {"high": 0.9, "h": 0.9, "medium": 0.6, "med": 0.6, "m": 0.6, "low": 0.3, "l": 0.3}
+    if s in table:
+        return table[s]
+    try:
+        return float(s)
+    except ValueError:
+        raise ValueError(f"confidence 非法: {value!r}（需数值 0..1 或 high/medium/low）")
+
+
 def slugify(text: str, maxlen: int = 48) -> str:
     text = unicodedata.normalize("NFKC", text or "").strip()
     import re
@@ -99,6 +117,8 @@ class Note:
             raise ValueError(f"status 必须是 {STATUSES} 之一，收到 {self.status!r}")
         if not (1 <= int(self.importance) <= 10):
             raise ValueError("importance 必须在 1..10")
+        if self.confidence is not None:
+            self.confidence = normalize_confidence(self.confidence)
         if self.confidence is not None and not (0.0 <= float(self.confidence) <= 1.0):
             raise ValueError("confidence 必须在 0..1")
         return self
@@ -138,7 +158,7 @@ class Note:
             body=body or "", type=str(known.get("type") or "note"),
             layer=str(known.get("layer") or "semantic"), status=str(known.get("status") or "active"),
             created=str(known.get("created") or now_iso()), updated=str(known.get("updated") or now_iso()),
-            importance=int(known.get("importance") or 5), confidence=known.get("confidence"),
+            importance=int(known.get("importance") or 5), confidence=normalize_confidence(known.get("confidence")),
             last_accessed=known.get("last_accessed"), access_count=int(known.get("access_count") or 0),
             tags=list(known.get("tags") or []), entities=list(known.get("entities") or []),
             links=list(known.get("links") or []), supersedes=list(known.get("supersedes") or []),

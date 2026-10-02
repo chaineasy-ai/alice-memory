@@ -426,6 +426,10 @@ def main(argv=None) -> int:
     except TimeoutError as e:
         print(json.dumps({"schema_version": "mem.error.v1", "error": str(e), "code": 4}, ensure_ascii=False))
         return 4
+    except ValueError as e:
+        # R448：非法字段（如 confidence 枚举）→ exit 2，不 traceback
+        print(json.dumps({"schema_version": "mem.error.v1", "error": str(e), "code": 2}, ensure_ascii=False))
+        return 2
     except (OSError, sqlite3.Error) as e:
         print(json.dumps({"schema_version": "mem.error.v1", "error": str(e), "code": 5}, ensure_ascii=False))
         return 5

@@ -202,3 +202,25 @@ def test_add_file_preserves_frontmatter(tmp_path):
     n2 = mem(tmp_path, "add", "手工笔记", "--created", "2025-01-01T00:00:00+08:00",
              "--last-accessed", "2025-02-01T00:00:00+08:00")["note"]
     assert n2["created"].startswith("2025-01-01") and n2["last_accessed"].startswith("2025-02-01")
+
+
+def test_confidence_enum_normalization_r448(tmp_path):
+    """R448：confidence 枚举 high/medium/low → 0.9/0.6/0.3；非法 → exit 2 不 traceback。"""
+    import json as _j
+    for enum, val in (("high", 0.9), ("medium", 0.6), ("low", 0.3)):
+        f = tmp_path / f"c_{enum}.md"
+        f.write_text(f"---\ntitle: t_{enum}\nconfidence: {enum}\n---\nbody\n", encoding="utf-8")
+        n = mem(tmp_path, "add", "--file", str(f))["note"]
+        assert n["confidence"] == val, (enum, n["confidence"])
+    # 数值仍可用
+    f = tmp_path / "num.md"
+    f.write_text("---\ntitle: num\nconfidence: 0.75\n---\nb\n", encoding="utf-8")
+    assert abs(mem(tmp_path, "add", "--file", str(f))["note"]["confidence"] - 0.75) < 1e-9
+    # 非法 → exit 2，无 traceback
+    bad = tmp_path / "bad.md"
+    bad.write_text("---\ntitle: bad\nconfidence: bogus\n---\nb\n", encoding="utf-8")
+    p = subprocess.run([sys.executable, "-m", "alice_memory", "add", "--file", str(bad)],
+                       env={**os.environ, "PYTHONPATH": str(REPO / "src"), "MEM_HOME": str(tmp_path)},
+                       capture_output=True, text=True)
+    assert p.returncode == 2 and "Traceback" not in p.stderr
+    assert _j.loads(p.stdout)["code"] == 2
