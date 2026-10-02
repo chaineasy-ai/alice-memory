@@ -135,7 +135,7 @@ def cmd_search(store, index, mgr, recall, args):
                                         budget_unit=args.budget_unit, touch=args.touch)
     if args.touch and hits:
         from datetime import datetime, timezone
-        recall._touch(hits, datetime.now(timezone.utc).astimezone())
+        recall._touch(hits, datetime.now(timezone.utc).astimezone(), query=args.query)
     return _emit("search", out, 6 if degraded else 0)
 
 
@@ -143,6 +143,12 @@ def cmd_get(store, index, mgr, recall, args):
     note = store.find_by_id(args.id)
     if not note:
         return _emit("get", {"error": f"未找到记忆: {args.id}"}, 3)
+    try:
+        from .model import now_iso
+        store.append_access({"ts": now_iso(), "id": note.id, "event": "get",
+                             "layer": note.layer})
+    except Exception:
+        pass
     return _emit("get", {"note": _note_json(note)})
 
 
@@ -202,7 +208,18 @@ def cmd_stats(store, index, mgr, recall, args):
     return _emit("stats", {"total": len(notes), "by_namespace": by_ns, "by_layer": by_layer,
                            "by_status": by_status, "gc_candidates": len(mgr.gc_candidates()),
                            "index_schema": "mem.index.v1",
-                           "vectors": sum(1 for _ in index.iter_vectors()), "links": links})
+                           "vectors": sum(1 for _ in index.iter_vectors()), "links": links,
+                           "access_log": _access_log_count(store)})
+
+
+def _access_log_count(store) -> int:
+    p = store.indexdir / "access.log"
+    if not p.exists():
+        return 0
+    try:
+        return sum(1 for _ in p.open(encoding="utf-8"))
+    except OSError:
+        return 0
 
 
 def cmd_context(store, index, mgr, recall, args):

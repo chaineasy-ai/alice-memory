@@ -199,6 +199,18 @@ class MemoryStore:
         note.layer = layer
         return self.write(note, namespace)
 
+    # -- 访问日志（半衰期/去重校准用，append-only JSONL） ------------------
+    def append_access(self, record: dict) -> None:
+        import json as _json
+        self.indexdir.mkdir(parents=True, exist_ok=True)
+        line = (_json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        fd = os.open(self.indexdir / "access.log",
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line)          # O_APPEND 单次写对小行在 Linux 上原子
+        finally:
+            os.close(fd)
+
     def delete(self, note: Note) -> None:
         if note.path:
             Path(note.path).unlink(missing_ok=True)

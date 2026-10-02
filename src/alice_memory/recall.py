@@ -185,7 +185,7 @@ class RecallEngine:
         for s in top:
             s.note = self._load_note(s.note.id, self.index.get_meta(s.note.id) or {})
         if touch:
-            self._touch(top, now)
+            self._touch(top, now, query=query)
         return top
 
     @staticmethod
@@ -214,13 +214,22 @@ class RecallEngine:
         age_hours = max(0.0, (now - ref).total_seconds() / 3600.0)
         return 0.5 ** (age_hours / self.config.half_life_hours)
 
-    def _touch(self, scored: list[ScoredNote], now: datetime) -> None:
+    def _touch(self, scored: list[ScoredNote], now: datetime, query: str = "") -> None:
         for s in scored:
             if s.note.path:
                 s.note.touch(now.isoformat())
                 try:
                     self.store.write(s.note)
                     self.index.upsert(s.note)
+                except Exception:
+                    pass
+                # 访问日志：为半衰期 H / 去重阈值校准提供时间序列真值
+                try:
+                    self.store.append_access({
+                        "ts": now.isoformat(), "id": s.note.id, "event": "recall",
+                        "query": query, "score": s.score, "layer": s.note.layer,
+                        "components": s.components,
+                    })
                 except Exception:
                     pass
 
