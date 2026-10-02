@@ -49,7 +49,12 @@ def content_hash(note_or_text) -> str:
 
 
 def _pack_vector(vec: Optional[list[float]]) -> Optional[bytes]:
-    if not vec:
+    if vec is None:
+        return None
+    try:
+        if len(vec) == 0:
+            return None
+    except TypeError:
         return None
     return struct.pack(f"<{len(vec)}f", *[float(x) for x in vec])
 
@@ -225,7 +230,7 @@ class MemoryIndex:
             cur = self.conn.execute(
                 "SELECT id, bm25(fts_bi) AS rank FROM fts_bi "
                 "WHERE fts_bi MATCH ? ORDER BY rank LIMIT ?", (match, limit))
-            return [(r["id"], 1.0 / (1.0 + abs(r["rank"]))) for r in cur]
+            return [(r["id"], -float(r["rank"])) for r in cur]  # bm25 越小/越负越相关
         except sqlite3.OperationalError:
             return []
 
@@ -241,7 +246,7 @@ class MemoryIndex:
                 "WHERE fts_cjk MATCH ? ORDER BY rank LIMIT ?",
                 (match, limit),
             )
-            return [(r["id"], 1.0 / (1.0 + abs(r["rank"]))) for r in cur]
+            return [(r["id"], -float(r["rank"])) for r in cur]  # bm25 越小/越负越相关
         except sqlite3.OperationalError:
             return []
 
@@ -258,7 +263,7 @@ class MemoryIndex:
                 (match, limit),
             )
             # bm25() 越小越相关 -> 转成越大越好
-            return [(r["id"], 1.0 / (1.0 + abs(r["rank"]))) for r in cur]
+            return [(r["id"], -float(r["rank"])) for r in cur]  # bm25 越小/越负越相关
         except sqlite3.OperationalError:
             return []
 
