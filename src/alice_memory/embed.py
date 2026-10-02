@@ -18,6 +18,7 @@ from typing import Optional, Protocol
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "nomic-embed-text"
+DEFAULT_LOCAL_MODEL = "/mnt/data/ai_workspace/models/models/BAAI--bge-m3/snapshots/master"
 
 
 class Embedder(Protocol):
@@ -75,6 +76,26 @@ class OllamaEmbedder:
         return self.embed("ping") is not None
 
 
+class LocalSTEmbedder:
+    """本地 sentence-transformers 模型（GPU 优先）————hybrid 端到端零付费后端。"""
+
+    def __init__(self, model: str = DEFAULT_LOCAL_MODEL):
+        from sentence_transformers import SentenceTransformer  # 可选依赖
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._m = SentenceTransformer(model, device=device)
+        self.name = f"local:{model}"
+        self.dim = int(self._m.get_sentence_embedding_dimension())
+
+    def embed(self, text: str):
+        return [float(x) for x in self._m.encode(text, normalize_embeddings=True)]
+
+    def embed_batch(self, texts):
+        arr = self._m.encode(list(texts), batch_size=16, normalize_embeddings=True,
+                             show_progress_bar=False)
+        return [[float(x) for x in v] for v in arr]
+
+
 def get_embedder(backend: str = "none", model: str = DEFAULT_OLLAMA_MODEL,
                  url: str = DEFAULT_OLLAMA_URL) -> Embedder:
     """按名称获取嵌入后端；不可用/未知则返回 NullEmbedder。"""
@@ -83,6 +104,12 @@ def get_embedder(backend: str = "none", model: str = DEFAULT_OLLAMA_MODEL,
         return NullEmbedder()
     if backend == "ollama":
         return OllamaEmbedder(model=model, url=url)
+    if backend == "local":
+        try:
+            path = model if model and model not in (DEFAULT_OLLAMA_MODEL, "none", "") else DEFAULT_LOCAL_MODEL
+            return LocalSTEmbedder(path)
+        except Exception:
+            return NullEmbedder()
     if backend in ("sentence-transformers", "st"):
         try:  # pragma: no cover - 依赖可选安装
             from sentence_transformers import SentenceTransformer  # type: ignore

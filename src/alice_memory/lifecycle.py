@@ -79,6 +79,8 @@ class MemoryManager:
             owner: str = "", scope: str = "agent", domain: str = "",
             expires: Optional[str] = None, note_id: Optional[str] = None,
             idempotency_key: Optional[str] = None,
+            created: Optional[str] = None, updated: Optional[str] = None,
+            last_accessed: Optional[str] = None, access_count: Optional[int] = None,
             namespace: str = SHARED, dedup: bool = True, force: bool = False) -> WriteResult:
         ns = self.store.normalize_namespace(namespace)
         note = Note(
@@ -89,6 +91,16 @@ class MemoryManager:
             owner=owner, scope=scope, domain=domain, expires=expires,
             idempotency_key=idempotency_key,
         )
+        if created:
+            note.created = created.isoformat() if hasattr(created, "isoformat") else str(created)
+        if updated:
+            note.updated = updated.isoformat() if hasattr(updated, "isoformat") else str(updated)
+        if last_accessed:
+            note.last_accessed = last_accessed.isoformat() if hasattr(last_accessed, "isoformat") else str(last_accessed)
+        if access_count is not None:
+            note.access_count = int(access_count)
+        if note.expires:
+            note.expires = note.expires.isoformat() if hasattr(note.expires, "isoformat") else str(note.expires)
         note.validate()
 
         # 写临界区：namespace 锁内「重读 → 判定 → 原子写 → 同锁更新索引」

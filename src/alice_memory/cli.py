@@ -45,11 +45,13 @@ def _emit(cmd: str, payload: dict, exit_code: int = 0) -> int:
     return exit_code
 
 
-def _make(root: str, lock_timeout: float, embed_backend: str, tokenizer: str = "trigram"):
+def _make(root: str, lock_timeout: float, embed_backend: str, tokenizer: str = "trigram",
+          embed_model: str = ""):
     store = MemoryStore(root, lock_timeout=lock_timeout)
     store.init()
     index = MemoryIndex(store.indexdir / "index.sqlite", tokenizer=tokenizer)
-    embedder = get_embedder(embed_backend)
+    embedder = get_embedder(embed_backend, model=embed_model or "none",
+                            url=os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434"))
     return store, index, MemoryManager(store, index, embedder), RecallEngine(store, index, embedder)
 
 
@@ -108,13 +110,15 @@ def _resolve_file_title(meta: dict, body: str, path: Path) -> str:
 
 def cmd_add(store, index, mgr, recall, args):
     ns = args.namespace or os.environ.get("MEM_AGENT") or SHARED
+    meta: dict = {}
     if args.file:
         import re as _re
         p = Path(args.file)
         meta, body = fm.split_frontmatter(p.read_text(encoding="utf-8"))
+        meta = meta or {}
         body = body.strip()
         title = args.title_opt or _resolve_file_title(meta, body, p)
-        if not args.title_opt and _first_h1(body) and not (meta or {}).get("title"):
+        if not args.title_opt and _first_h1(body) and not meta.get("title"):
             body = _re.sub(r"^#\s+.+?\s*$", "", body, count=1, flags=_re.M).strip()
     else:
         title = args.title_opt or args.pos_title or ""
@@ -123,15 +127,45 @@ def cmd_add(store, index, mgr, recall, args):
             title = (body or "").strip().split("\n", 1)[0]
     if not title:
         return _emit("add", {"error": "缺少标题/内容"}, 2)
-    tags = _split_csv(list(args.tags) + list(args.tag))
-    links = _split_csv(args.link)
-    res = mgr.add(title.strip(), body.strip(), layer=args.layer, type=args.type,
-                  tags=tags, entities=_split_csv(args.entities), importance=args.importance,
-                  confidence=args.confidence, source=args.source,
-                  source_type=args.source_type, links=links, summary=args.summary,
-                  owner=args.owner, scope=args.scope, domain=args.domain,
-                  expires=args.expires, note_id=args.id,
-                  idempotency_key=args.idempotency_key, namespace=ns, force=args.force)
+
+    def pick(cli, key, default):
+        if cli is not None and cli != "":
+            return cli
+        v = meta.get(key)
+        return v if v not in (None, "") else default
+
+    def merge(cli_list, key):
+        return list(dict.fromkeys(_split_csv(cli_list) + [str(x) for x in (meta.get(key) or [])]))
+
+    # add --file：以 frontmatter 为基，CLI 显式值覆盖（不丢迁移元数据）
+    mid = args.id or str(meta.get("id") or "") or None
+    if mid and store.find_by_id(mid):        # 防静默覆盖：已存在同 id 则不沿用 meta id
+        mid = args.id
+    res = mgr.add(
+        title.strip(), body.strip(),
+        layer=pick(args.layer, "layer", "semantic"),
+        type=pick(args.type, "type", "note"),
+        status=str(meta.get("status") or "active"),
+        tags=merge(list(args.tags) + list(args.tag), "tags"),
+        entities=merge(args.entities, "entities"),
+        links=merge(args.link, "links"),
+        importance=args.importance if args.importance is not None else (meta.get("importance") or 5),
+        confidence=args.confidence if args.confidence is not None else meta.get("confidence"),
+        source=pick(args.source, "source", ""),
+        source_type=pick(args.source_type, "source_type", "unknown"),
+        summary=pick(args.summary, "summary", ""),
+        owner=pick(args.owner, "owner", ""),
+        scope=pick(args.scope, "scope", "agent"),
+        domain=pick(args.domain, "domain", ""),
+        expires=args.expires or meta.get("expires"),
+        note_id=mid,
+        idempotency_key=args.idempotency_key or meta.get("idempotency_key"),
+        created=args.created or meta.get("created"),
+        updated=meta.get("updated"),
+        last_accessed=args.last_accessed or meta.get("last_accessed"),
+        access_count=meta.get("access_count"),
+        namespace=ns, force=args.force,
+    )
     return _emit("add", {"event": res.status, "message": res.message,
                          "related": res.related, "note": _note_json(res.note)})
 
@@ -215,7 +249,11 @@ def cmd_gc(store, index, mgr, recall, args):
 
 
 def cmd_reindex(store, index, mgr, recall, args):
-    return _emit("reindex", {"indexed": mgr.reindex(), "db": str(index.db_path)})
+    if getattr(args, "embed", None):
+        from .embed import get_embedder
+        mgr.embedder = get_embedder(args.embed, model=args.embed_model or "none")
+    return _emit("reindex", {"indexed": mgr.reindex(), "db": str(index.db_path),
+                             "vectors": sum(1 for _ in index.iter_vectors())})
 
 
 def cmd_stats(store, index, mgr, recall, args):
@@ -274,7 +312,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--namespace", default=None,
                    help="读写命名空间；写默认 $MEM_AGENT→agents/<id>，读默认全部")
     p.add_argument("--lock-timeout", type=float, default=5.0)
-    p.add_argument("--embed", default="none", choices=["none", "ollama"])
+    p.add_argument("--embed", default="none", choices=["none", "ollama", "local"])
+    p.add_argument("--embed-model", default=os.environ.get("MEM_EMBED_MODEL", ""),
+                   help="embedding 模型路径/名（local 后端默认 BAAI/bge-m3 本地快照）")
     p.add_argument("--lexical-tokenizer", default=os.environ.get("MEM_TOKENIZER", "trigram"),
                    choices=["trigram", "bigram"], help="词法分词（v0 默认 trigram；bigram 为 #232 spike）")
     p.add_argument("--json", action="store_true", help="JSON 输出（默认即 JSON）")
@@ -288,21 +328,23 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--title", dest="title_opt", default="")
     a.add_argument("--text", default="")
     a.add_argument("--file")
-    a.add_argument("--type", default="note", choices=TYPES)
-    a.add_argument("--layer", default="semantic", choices=LAYERS)
+    a.add_argument("--type", default=None, choices=TYPES)
+    a.add_argument("--layer", default=None, choices=LAYERS)
     a.add_argument("--tags", nargs="*", default=[])
     a.add_argument("--tag", action="append", default=[])
     a.add_argument("--entities", nargs="*", default=[])
     a.add_argument("--link", action="append", default=[])
-    a.add_argument("--importance", type=int, default=5)
+    a.add_argument("--importance", type=int, default=None)
     a.add_argument("--confidence", type=float)
-    a.add_argument("--source", default="")
-    a.add_argument("--source-type", default="unknown")
-    a.add_argument("--summary", default="")
-    a.add_argument("--owner", default="")
-    a.add_argument("--scope", default="agent")
-    a.add_argument("--domain", default="")
+    a.add_argument("--source", default=None)
+    a.add_argument("--source-type", default=None)
+    a.add_argument("--summary", default=None)
+    a.add_argument("--owner", default=None)
+    a.add_argument("--scope", default=None)
+    a.add_argument("--domain", default=None)
     a.add_argument("--expires")
+    a.add_argument("--created", help="创建时间（迁移用，ISO-8601）")
+    a.add_argument("--last-accessed", help="上次访问时间（迁移/校准用）")
     a.add_argument("--id")
     a.add_argument("--idempotency-key")
     a.add_argument("--namespace")
@@ -351,7 +393,11 @@ def build_parser() -> argparse.ArgumentParser:
     gc.add_argument("--apply", action="store_true")
     _add_common_json(gc); gc.set_defaults(func=cmd_gc)
 
-    r = sub.add_parser("reindex"); _add_common_json(r); r.set_defaults(func=cmd_reindex)
+    r = sub.add_parser("reindex")
+    r.add_argument("--embed", choices=["none", "ollama", "local"], default=None,
+                   help="重建时同时灌向量（hybrid 用）")
+    r.add_argument("--embed-model", default=None)
+    _add_common_json(r); r.set_defaults(func=cmd_reindex)
     st = sub.add_parser("stats"); _add_common_json(st); st.set_defaults(func=cmd_stats)
 
     ct = sub.add_parser("context")
@@ -373,7 +419,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    store, index, mgr, recall = _make(args.root, args.lock_timeout, args.embed, args.lexical_tokenizer)
+    store, index, mgr, recall = _make(args.root, args.lock_timeout, args.embed,
+                                      args.lexical_tokenizer, args.embed_model)
     try:
         return args.func(store, index, mgr, recall, args)
     except TimeoutError as e:

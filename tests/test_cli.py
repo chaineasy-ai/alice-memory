@@ -179,3 +179,26 @@ def test_adopt_not_found_exit3(tmp_path):
                        env={**os.environ, "PYTHONPATH": str(REPO / "src"),
                             "MEM_HOME": str(tmp_path)}, capture_output=True, text=True)
     assert p.returncode == 3
+
+
+def test_add_file_preserves_frontmatter(tmp_path):
+    """curie H 校准阻塞项：add --file 必须保留 frontmatter 全字段 + created/last_accessed。"""
+    f = tmp_path / "full.md"
+    f.write_text(
+        "---\nid: mem-20251001-abcd12\ntitle: 迁移\nlayer: episodic\ntype: episode\n"
+        "importance: 9\nconfidence: 0.8\ntags: [a, b]\nentities: [Foo]\nlinks: [mem-other]\n"
+        "source: s.md\nsource_type: doc\nsummary: 摘要\nowner: curie\ndomain: research\n"
+        "created: 2025-10-01T10:00:00+08:00\nupdated: 2025-10-02T10:00:00+08:00\n"
+        "last_accessed: 2025-10-03T10:00:00+08:00\naccess_count: 7\n---\n正文\n",
+        encoding="utf-8")
+    n = mem(tmp_path, "add", "--file", str(f))["note"]
+    assert n["id"] == "mem-20251001-abcd12"
+    assert n["layer"] == "episodic" and n["type"] == "episode"
+    assert n["importance"] == 9 and abs(n["confidence"] - 0.8) < 1e-9
+    assert n["tags"] == ["a", "b"] and n["entities"] == ["Foo"] and n["links"] == ["mem-other"]
+    assert n["owner"] == "curie" and n["domain"] == "research"
+    assert n["created"].startswith("2025-10-01") and n["access_count"] == 7
+    # --created / --last-accessed 显式
+    n2 = mem(tmp_path, "add", "手工笔记", "--created", "2025-01-01T00:00:00+08:00",
+             "--last-accessed", "2025-02-01T00:00:00+08:00")["note"]
+    assert n2["created"].startswith("2025-01-01") and n2["last_accessed"].startswith("2025-02-01")
