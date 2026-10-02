@@ -136,3 +136,46 @@ def test_contract_cli_forms_ci034(tmp_path):
     ctx = mem(tmp_path, "context", "记忆分层", "--budget", "2000",
               "--budget-unit", "tokens", "-k", "5", "--json")
     assert ctx["schema_version"] == "mem.context.v1"
+
+
+def test_add_file_title_fallback_i6(tmp_path):
+    # 1) frontmatter title
+    f1 = tmp_path / "a.md"
+    f1.write_text("---\ntitle: FM 标题\n---\n正文一\n", encoding="utf-8")
+    assert mem(tmp_path, "add", "--file", str(f1))["note"]["title"] == "FM 标题"
+    # 2) name-only（旧实现 exit 2）
+    f2 = tmp_path / "b.md"
+    f2.write_text("---\nname: Name 标题\n---\n正文二\n", encoding="utf-8")
+    assert mem(tmp_path, "add", "--file", str(f2))["note"]["title"] == "Name 标题"
+    # 3) 无 meta + H1 → H1
+    f3 = tmp_path / "c.md"
+    f3.write_text("# H1 标题\n正文三\n", encoding="utf-8")
+    assert mem(tmp_path, "add", "--file", str(f3))["note"]["title"] == "H1 标题"
+    # 4) 无 meta 无 H1 → 文件名，且**不得取正文**
+    f4 = tmp_path / "myfile.md"
+    f4.write_text("这是正文第一行，不应作为标题\n第二行\n", encoding="utf-8")
+    t4 = mem(tmp_path, "add", "--file", str(f4))["note"]["title"]
+    assert t4 == "myfile" and t4 != "这是正文第一行，不应作为标题"
+
+
+def test_access_log_recall_and_adopt(tmp_path):
+    a = mem(tmp_path, "add", "--title", "检索设计", "--text", "FTS5 trigram 词法")
+    mid = a["note"]["id"]
+    mem(tmp_path, "search", "trigram", "-k", "3", "--touch")
+    log = (tmp_path / ".mem" / "access.log").read_text(encoding="utf-8").strip().splitlines()
+    import json as _j
+    rec = [_j.loads(x) for x in log]
+    assert rec and rec[0]["event"] == "recall" and rec[0]["adopted"] is False
+    assert "rank" in rec[0] and "components" in rec[0]
+    # 采纳信号
+    ad = mem(tmp_path, "adopt", mid, "--rank", "1", "--query", "trigram")
+    assert ad["schema_version"] == "mem.adopt.v1" and ad["adopted"] is True
+    log2 = (tmp_path / ".mem" / "access.log").read_text(encoding="utf-8")
+    assert '"event": "adopt"' in log2 and '"adopted": true' in log2
+
+
+def test_adopt_not_found_exit3(tmp_path):
+    p = subprocess.run([sys.executable, "-m", "alice_memory", "adopt", "nope"],
+                       env={**os.environ, "PYTHONPATH": str(REPO / "src"),
+                            "MEM_HOME": str(tmp_path)}, capture_output=True, text=True)
+    assert p.returncode == 3

@@ -215,7 +215,7 @@ class RecallEngine:
         return 0.5 ** (age_hours / self.config.half_life_hours)
 
     def _touch(self, scored: list[ScoredNote], now: datetime, query: str = "") -> None:
-        for s in scored:
+        for rank, s in enumerate(scored, start=1):
             if s.note.path:
                 s.note.touch(now.isoformat())
                 try:
@@ -223,15 +223,29 @@ class RecallEngine:
                     self.index.upsert(s.note)
                 except Exception:
                     pass
-                # 访问日志：为半衰期 H / 去重阈值校准提供时间序列真值
+                # 访问日志：为半衰期 H / 去重阈值校准提供时间序列真值。
+                # adopted 初始 false；由 `mem adopt <id>` 单独追加采纳事件（append-only）。
                 try:
                     self.store.append_access({
                         "ts": now.isoformat(), "id": s.note.id, "event": "recall",
-                        "query": query, "score": s.score, "layer": s.note.layer,
+                        "query": query, "rank": rank, "adopted": False,
+                        "score": s.score, "layer": s.note.layer,
                         "components": s.components,
                     })
                 except Exception:
                     pass
+
+    def adopt(self, note_id: str, *, query: str = "", rank: int | None = None,
+              namespace: str | None = None) -> bool:
+        """追加采纳信号（agent 已将某条记忆用于输出/用户认可）。"""
+        if not self.store.find_by_id(note_id, namespace):
+            return False
+        from .model import now_iso
+        self.store.append_access({
+            "ts": now_iso(), "id": note_id, "event": "adopt", "adopted": True,
+            "query": query, "rank": rank,
+        })
+        return True
 
     # -- 上下文装配 -------------------------------------------------------
     def context(self, query: str, token_budget: int = 2000, k: int = 10,

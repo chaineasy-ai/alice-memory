@@ -31,11 +31,13 @@ from .lifecycle import GcPolicy, MemoryManager
 from .model import LAYERS, TYPES
 from .recall import RecallEngine
 from .store import MemoryStore, SHARED
+from . import frontmatter as fm
 
 SCHEMA = {"add": "mem.add.v1", "search": "mem.search.v1", "get": "mem.get.v1",
           "update": "mem.update.v1", "link": "mem.link.v1", "gc": "mem.gc.v1",
           "reindex": "mem.reindex.v1", "stats": "mem.stats.v1",
-          "init": "mem.init.v1", "context": "mem.context.v1"}
+          "init": "mem.init.v1", "context": "mem.context.v1",
+          "adopt": "mem.adopt.v1"}
 
 
 def _emit(cmd: str, payload: dict, exit_code: int = 0) -> int:
@@ -86,12 +88,34 @@ def cmd_init(store, index, mgr, recall, args):
     return _emit("init", {"root": str(store.root), "ok": True})
 
 
+def _first_h1(body: str) -> str:
+    import re
+    m = re.search(r"^#\s+(.+?)\s*$", body or "", re.M)
+    return m.group(1).strip() if m else ""
+
+
+def _resolve_file_title(meta: dict, body: str, path: Path) -> str:
+    """add --file 标题回退链：title → name → 首个 H1 → 文件名（**不得取正文**）。"""
+    for key in ("title", "name"):
+        v = str((meta or {}).get(key) or "").strip()
+        if v:
+            return v
+    h1 = _first_h1(body)
+    if h1:
+        return h1
+    return path.stem
+
+
 def cmd_add(store, index, mgr, recall, args):
     ns = args.namespace or os.environ.get("MEM_AGENT") or SHARED
     if args.file:
-        from .model import Note
-        note = Note.from_text(Path(args.file).read_text(encoding="utf-8"))
-        title, body = args.title_opt or note.title, note.body
+        import re as _re
+        p = Path(args.file)
+        meta, body = fm.split_frontmatter(p.read_text(encoding="utf-8"))
+        body = body.strip()
+        title = args.title_opt or _resolve_file_title(meta, body, p)
+        if not args.title_opt and _first_h1(body) and not (meta or {}).get("title"):
+            body = _re.sub(r"^#\s+.+?\s*$", "", body, count=1, flags=_re.M).strip()
     else:
         title = args.title_opt or args.pos_title or ""
         body = args.text or args.pos_body or ""
@@ -222,6 +246,15 @@ def _access_log_count(store) -> int:
         return 0
 
 
+def cmd_adopt(store, index, mgr, recall, args):
+    ok = recall.adopt(args.id, query=args.query or "", rank=args.rank,
+                      namespace=args.namespace)
+    if not ok:
+        return _emit("adopt", {"error": f"未找到记忆: {args.id}"}, 3)
+    return _emit("adopt", {"id": args.id, "adopted": True, "rank": args.rank,
+                           "query": args.query or "", "log": str(store.indexdir / "access.log")})
+
+
 def cmd_context(store, index, mgr, recall, args):
     text = recall.context(args.query, token_budget=args.budget, k=args.k,
                           budget_unit=args.budget_unit, touch=args.touch)
@@ -326,6 +359,13 @@ def build_parser() -> argparse.ArgumentParser:
     ct.add_argument("--budget-unit", default="tokens", choices=["tokens", "chars"])
     ct.add_argument("--touch", action="store_true")
     _add_common_json(ct); ct.set_defaults(func=cmd_context)
+
+    ad = sub.add_parser("adopt", help="记录采纳信号（adopted=True，供 H 校准）")
+    ad.add_argument("id")
+    ad.add_argument("--query", default="")
+    ad.add_argument("--rank", type=int)
+    ad.add_argument("--namespace")
+    _add_common_json(ad); ad.set_defaults(func=cmd_adopt)
     return p
 
 
