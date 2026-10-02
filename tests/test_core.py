@@ -192,3 +192,48 @@ def test_tokenizer_mismatch_guard_g1(tmp_path):
     MemoryManager(store, idx2).reindex()
     assert idx2.search_fts("记忆", 5)
     idx2.close()
+
+
+class _FakeEmb:
+    name = "fake"
+    dim = 2
+
+    def __init__(self, vec):
+        self.vec = list(vec)
+
+    def embed(self, text):
+        return list(self.vec)
+
+    def embed_batch(self, texts):
+        return [list(self.vec) for _ in texts]
+
+
+def test_query_type_routing_g2(tmp_path):
+    from alice_memory.recall import RecallEngine, classify_query, HybridRetriever, LexicalRetriever
+    assert classify_query("向量") == "short"
+    assert classify_query("trigram") == "keyword"
+    assert classify_query("解释一下 markdown 记忆系统的检索与召回设计") == "semantic"
+    store = MemoryStore(tmp_path); store.init()
+    idx = MemoryIndex(store.indexdir / "index.sqlite")
+    idx.upsert(Note(id="a", title="记忆检索", body="markdown 记忆检索召回设计"), vector=[1.0, 0.0])
+    eng = RecallEngine(store, idx, _FakeEmb([1.0, 0.0]))
+    assert eng._retriever("auto", "向量").name == "lexical"           # short → 纯词法
+    assert eng._retriever("auto", "解释一下 markdown 记忆系统的检索与召回设计").name == "hybrid"  # semantic → 向量
+    assert eng._retriever("lexical", "解释一下 markdown 记忆系统的检索与召回设计").name == "lexical"
+    idx.close()
+
+
+def test_link_second_signal_g4(tmp_path):
+    import math
+    store = MemoryStore(tmp_path); store.init()
+    idx = MemoryIndex(store.indexdir / "index.sqlite")
+    # A 向量 [1,0]；候选 note 向量与之 cosine≈0.87 ∈[0.84,0.90)
+    other = [0.87, math.sqrt(1 - 0.87 ** 2)]
+    idx.upsert(Note(id="A", title="A", body="x", entities=["X"]), vector=[1.0, 0.0])
+    idx.upsert(Note(id="B", title="B", body="x"), vector=[1.0, 0.0])   # 实体不重叠
+    mgr = MemoryManager(store, idx, _FakeEmb(other))
+    cand_overlap = Note(id="N1", title="n1", body="x", entities=["X"])   # 实体重叠 → link
+    cand_plain = Note(id="N2", title="n2", body="x")                    # 无第二信号 → 不 link
+    assert mgr._link_candidates(cand_overlap) == ["A"]
+    assert mgr._link_candidates(cand_plain) == []
+    idx.close()

@@ -49,28 +49,31 @@ class LexicalRetriever:
 
 
 class HybridRetriever:
-    """v0.1：FTS5 + 向量 → RRF（零标定）。"""
+    """v0.1：FTS5 + 向量 → 加权 RRF（w_vec≤w_lex；题型路由由 RecallEngine 决定）。"""
 
     name = "hybrid"
 
-    def __init__(self, index: MemoryIndex, embedder: Embedder, k_rrf: float = RRF_K):
+    def __init__(self, index: MemoryIndex, embedder: Embedder, k_rrf: float = RRF_K,
+                 w_lex: float = 1.0, w_vec: float = 1.0):
         self.index = index
         self.embedder = embedder
         self.k_rrf = k_rrf
+        self.w_lex = w_lex
+        self.w_vec = w_vec
 
     def retrieve(self, query: str, k: int, *, filters: dict) -> list[tuple[str, float]]:
         pool = max(k * 4, 40)
         fts = self.index.search_fts(query, limit=pool)
-        rank_lists = [[nid for nid, _ in fts]]
+        rank_lists = [([nid for nid, _ in fts], self.w_lex)]
         qvec = self.embedder.embed(query) if self.embedder.name != "none" else None
         if qvec:
             vec = sorted(((nid, cosine(qvec, v)) for nid, v in self.index.iter_vectors()),
                          key=lambda x: x[1], reverse=True)[:pool]
-            rank_lists.append([nid for nid, _ in vec])
+            rank_lists.append(([nid for nid, _ in vec], self.w_vec))
         fused: dict[str, float] = {}
-        for ranks in rank_lists:
+        for ranks, w in rank_lists:
             for rank, nid in enumerate(ranks):
-                fused[nid] = fused.get(nid, 0.0) + 1.0 / (self.k_rrf + rank + 1)
+                fused[nid] = fused.get(nid, 0.0) + w / (self.k_rrf + rank + 1)
         ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)
         if filters:
             ranked = [(nid, s) for nid, s in ranked if _match_filters(self.index.get_meta(nid), filters)]
@@ -84,6 +87,22 @@ class RecallConfig:
     w_imp: float = 0.5
     w_graph: float = 0.3
     half_life_hours: float = 720.0
+    semantic_w_vec: float = 0.9      # §4.9 条 3：仅 semantic 启向量（0.75–1.0）
+
+
+def classify_query(query: str) -> str:
+    """题型路由启发式（§4.9 条 3）：short / keyword → 纯词法；semantic → 启向量。"""
+    import re as _re
+    q = (query or "").strip()
+    if not q:
+        return "short"
+    cjk = len(_re.findall(r"[\u4e00-\u9fff]", q))
+    tokens = [t for t in _re.split(r"\s+", q) if t]
+    if len(q) <= 4 or (1 <= cjk <= 2 and len(tokens) <= 1):
+        return "short"
+    if len(q) >= 8 and (len(tokens) >= 2 or cjk >= 6):
+        return "semantic"
+    return "keyword"
 
 
 @dataclass
@@ -124,6 +143,28 @@ def _match_filters(meta: Optional[dict], filters: dict) -> bool:
     return True
 
 
+class LocalReranker:
+    """bge-reranker-v2-m3（条件化精排：仅 semantic；默认不加载）。"""
+
+    def __init__(self, model_path: str = "/mnt/data/ai_workspace/models/bge-reranker-v2-m3"):
+        from sentence_transformers import CrossEncoder
+        import torch
+        self.ce = CrossEncoder(model_path, device="cuda" if torch.cuda.is_available() else "cpu",
+                               max_length=512)
+
+    def rerank(self, query: str, hits: list["ScoredNote"], k: int) -> list["ScoredNote"]:
+        pairs = [(query, (h.note.body or "")[:650]) for h in hits]
+        scores = self.ce.predict(pairs)
+        order = sorted(range(len(hits)), key=lambda i: float(scores[i]), reverse=True)[:k]
+        out = []
+        for i in order:
+            h = hits[i]
+            h.components = {**h.components, "rerank": round(float(scores[i]), 6)}
+            h.reason = "rerank"
+            out.append(h)
+        return out
+
+
 class RecallEngine:
     def __init__(self, store: MemoryStore, index: MemoryIndex,
                  embedder: Optional[Embedder] = None, config: Optional[RecallConfig] = None):
@@ -131,16 +172,20 @@ class RecallEngine:
         self.index = index
         self.embedder = embedder or NullEmbedder()
         self.config = config or RecallConfig()
+        self.last_mode = "lexical"
+        self.reranker: Optional[LocalReranker] = None
 
-    def _retriever(self, mode: str) -> Retriever:
+    def _retriever(self, mode: str, query: str = "") -> Retriever:
         mode = (mode or "auto").lower()
-        if mode == "auto":
-            has_vec = any(True for _ in self.index.iter_vectors())
-            mode = "hybrid" if (has_vec and self.embedder.name != "none") else "lexical"
+        has_vec = any(True for _ in self.index.iter_vectors())
+        can_vec = has_vec and self.embedder.name != "none"
+        if mode == "lexical":
+            return LexicalRetriever(self.index)
         if mode == "hybrid":
-            if self.embedder.name != "none" and any(True for _ in self.index.iter_vectors()):
-                return HybridRetriever(self.index, self.embedder)
-            return LexicalRetriever(self.index)  # 降级
+            return HybridRetriever(self.index, self.embedder) if can_vec else LexicalRetriever(self.index)
+        # auto = 题型路由（v0.1，§4.9 条 3）
+        if can_vec and classify_query(query) == "semantic":
+            return HybridRetriever(self.index, self.embedder, w_lex=1.0, w_vec=self.config.semantic_w_vec)
         return LexicalRetriever(self.index)
 
     def search(self, query: str, k: int = 10, *, mode: str = "auto", layer: Optional[str] = None,
@@ -150,7 +195,9 @@ class RecallEngine:
         now = now or datetime.now(timezone.utc).astimezone()
         filters = {"layer": layer, "type": type, "tags": tags or [],
                    "namespace": namespace, "include_archived": include_archived}
-        raw = self._retriever(mode).retrieve(query, max(k * 4, k), filters=filters)
+        retriever = self._retriever(mode, query)
+        self.last_mode = retriever.name
+        raw = retriever.retrieve(query, max(k * 4, k), filters=filters)
         if not raw:
             return []
         max_rel = max(s for _, s in raw) or 1.0
@@ -180,10 +227,16 @@ class RecallEngine:
                 reason="linked" if graph else "",
             ))
         scored.sort(key=lambda s: s.score, reverse=True)
-        top = scored[:k]
-        # 只为最终 top-k 读盘（评分只用元数据）
-        for s in top:
-            s.note = self._load_note(s.note.id, self.index.get_meta(s.note.id) or {})
+        # G3：条件化精排——仅当显式加载 reranker 且查询为 semantic（调用方保证）
+        if self.reranker is not None and len(scored) > k:
+            pool = scored[:max(k * 3, 20)]
+            for s in pool:
+                s.note = self._load_note(s.note.id, self.index.get_meta(s.note.id) or {})
+            top = self.reranker.rerank(query, pool, k)
+        else:
+            top = scored[:k]
+            for s in top:
+                s.note = self._load_note(s.note.id, self.index.get_meta(s.note.id) or {})
         if touch:
             self._touch(top, now, query=query)
         return top

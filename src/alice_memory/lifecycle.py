@@ -71,6 +71,41 @@ class MemoryManager:
         hits.sort(key=lambda x: x[1], reverse=True)
         return [nid for nid, sim in hits if sim >= threshold and nid != note.id]
 
+    def _link_candidates(self, note: Note, lo: float = 0.84, hi: float = 0.90) -> list[str]:
+        """G4：link 第二信号 = 余弦 ∈[0.84,0.90) **且** 链接/实体重叠（单余弦不够）。"""
+        if self.embedder.name == "none":
+            return []
+        vec = self._vector_for(note)
+        if not vec:
+            return []
+        ents, links = set(note.entities), set(note.links)
+        out: list[str] = []
+        for nid, v in self.index.iter_vectors():
+            if nid == note.id:
+                continue
+            c = cosine(vec, v)
+            if not (lo <= c < hi):
+                continue
+            meta = self.index.get_meta(nid) or {}
+            o_ents = set((meta.get("entities") or "").split())
+            o_links = set((meta.get("links") or "").split())
+            if (ents & o_ents) or (links & o_links) or (nid in links):
+                out.append(nid)
+        return out
+
+    def _link_bidirectional(self, a: Note, b: Note) -> None:
+        """调用方需已持命名空间锁。"""
+        if b.id not in a.links:
+            a.links = sorted(set(a.links) | {b.id})
+            a.updated = now_iso()
+        if a.id not in b.links:
+            b.links = sorted(set(b.links) | {a.id})
+            b.updated = now_iso()
+        self.store.write(a, namespace=self.store.namespace_of(a.path), locked=True)
+        self.index.upsert(a)
+        self.store.write(b, namespace=self.store.namespace_of(b.path), locked=True)
+        self.index.upsert(b)
+
     # -- 写入 -------------------------------------------------------------
     def add(self, title: str, body: str = "", *, layer: str = "semantic",
             type: str = "note", status: str = "active", tags=None, entities=None,
@@ -111,6 +146,11 @@ class MemoryManager:
                     return dup
             self.store.write(note, namespace=ns, locked=True)
             self.index.upsert(note, vector=self._vector_for(note))
+            # G4：L2 link 第二信号（余弦 [0.84,0.90) 且链接/实体重叠）
+            for cid in self._link_candidates(note):
+                old = self.store.find_by_id(cid)
+                if old:
+                    self._link_bidirectional(note, old)
         return WriteResult("added", note, message="新建")
 
     def _find_duplicate(self, note: Note) -> Optional[WriteResult]:

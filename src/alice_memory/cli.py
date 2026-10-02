@@ -29,7 +29,7 @@ from .embed import get_embedder
 from .index import MemoryIndex
 from .lifecycle import GcPolicy, MemoryManager
 from .model import LAYERS, TYPES
-from .recall import RecallEngine
+from .recall import RecallEngine, classify_query
 from .store import MemoryStore, SHARED
 from . import frontmatter as fm
 
@@ -161,9 +161,9 @@ def cmd_add(store, index, mgr, recall, args):
         note_id=mid,
         idempotency_key=args.idempotency_key or meta.get("idempotency_key"),
         created=args.created or meta.get("created"),
-        updated=meta.get("updated"),
+        updated=args.updated or meta.get("updated"),
         last_accessed=args.last_accessed or meta.get("last_accessed"),
-        access_count=meta.get("access_count"),
+        access_count=args.access_count if args.access_count is not None else meta.get("access_count"),
         namespace=ns, force=args.force,
     )
     return _emit("add", {"event": res.status, "message": res.message,
@@ -175,10 +175,20 @@ def cmd_search(store, index, mgr, recall, args):
     has_vec = any(True for _ in index.iter_vectors())
     degraded = requested == "hybrid" and (recall.embedder.name == "none" or not has_vec)
     tags = _split_csv(list(args.tags) + list(args.tag))
+    query_type = classify_query(args.query)
+    # G3：条件化精排（仅 semantic；默认关闭；显式 --rerank 才加载）
+    reranked = False
+    if args.rerank and query_type == "semantic":
+        from .recall import LocalReranker
+        try:
+            recall.reranker = LocalReranker(args.rerank_model)
+            reranked = True
+        except Exception:
+            recall.reranker = None  # 降级：不影响返回
     hits = recall.search(args.query, k=args.k, mode=args.mode, layer=args.layer,
                          type=args.type, tags=tags, namespace=args.namespace,
                          include_archived=args.all, touch=False)
-    actual = "lexical" if (degraded or requested == "lexical" or not has_vec) else requested
+    actual = recall.last_mode + ("+rerank" if reranked else "")
     results = [{
         "id": h.note.id, "score": h.score, "path": h.note.path, "title": h.note.title,
         "layer": h.note.layer, "namespace": _ns(h.note.path),
@@ -186,8 +196,8 @@ def cmd_search(store, index, mgr, recall, args):
         "why": h.components, "why_reason": h.reason or "lexical",
         "source": h.note.source or "",
     } for h in hits]
-    out: dict[str, Any] = {"mode": actual, "count": len(results), "results": results,
-                           "degraded": degraded}
+    out: dict[str, Any] = {"mode": actual, "query_type": query_type, "count": len(results),
+                           "results": results, "degraded": degraded}
     if args.context:
         out["context"] = recall.context(args.query, token_budget=args.budget_tokens, k=args.k,
                                         budget_unit=args.budget_unit, touch=args.touch)
@@ -348,7 +358,9 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--domain", default=None)
     a.add_argument("--expires")
     a.add_argument("--created", help="创建时间（迁移用，ISO-8601）")
+    a.add_argument("--updated", help="更新时间（迁移用）")
     a.add_argument("--last-accessed", help="上次访问时间（迁移/校准用）")
+    a.add_argument("--access-count", type=int, help="访问计数（H 校准用）")
     a.add_argument("--id")
     a.add_argument("--idempotency-key")
     a.add_argument("--namespace")
@@ -360,7 +372,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("search")
     s.add_argument("query")
     s.add_argument("-k", "--k", type=int, default=10)
-    s.add_argument("--mode", default="lexical", choices=["lexical", "hybrid", "auto"])
+    s.add_argument("--mode", default="auto", choices=["lexical", "hybrid", "auto"])
     s.add_argument("--layer"); s.add_argument("--type")
     s.add_argument("--tags", nargs="*", default=[])
     s.add_argument("--tag", action="append", default=[])
@@ -370,6 +382,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--namespace")
     s.add_argument("--touch", action="store_true")
     s.add_argument("--all", dest="all", action="store_true")
+    s.add_argument("--rerank", action="store_true", help="条件化精排（仅 semantic；默认关）")
+    s.add_argument("--rerank-model", default="/mnt/data/ai_workspace/models/bge-reranker-v2-m3")
     _add_common_json(s); s.set_defaults(func=cmd_search)
 
     u = sub.add_parser("update")
