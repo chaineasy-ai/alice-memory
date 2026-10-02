@@ -329,8 +329,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--embed", default="none", choices=["none", "ollama", "local"])
     p.add_argument("--embed-model", default=os.environ.get("MEM_EMBED_MODEL", ""),
                    help="embedding 模型路径/名（local 后端默认 BAAI/bge-m3 本地快照）")
-    p.add_argument("--lexical-tokenizer", default=os.environ.get("MEM_TOKENIZER", "trigram"),
-                   choices=["trigram", "bigram"], help="词法分词（v0 默认 trigram；bigram 为 #232 spike）")
+    p.add_argument("--lexical-tokenizer", default=os.environ.get("MEM_TOKENIZER", "bigram"),
+                   choices=["trigram", "bigram"], help="词法分词（v0.1 默认 bigram；v0 为 trigram，开关可切）")
     p.add_argument("--json", action="store_true", help="JSON 输出（默认即 JSON）")
     sub = p.add_subparsers(dest="cmd", required=True)
 
