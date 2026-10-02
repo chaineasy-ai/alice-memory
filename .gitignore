@@ -27,3 +27,8 @@ replay_pid*
 memory-data/
 .mem/
 *.sqlite
+
+# Python 构建/缓存物（不入库）
+__pycache__/
+*.py[cod]
+.pytest_cache/
