@@ -141,7 +141,7 @@ class MemoryManager:
         # 写临界区：namespace 锁内「重读 → 判定 → 原子写 → 同锁更新索引」
         with self.store.lock(ns):
             if dedup and not force:
-                dup = self._find_duplicate(note)
+                dup = self._find_duplicate(note, ns)
                 if dup:
                     return dup
             self.store.write(note, namespace=ns, locked=True)
@@ -153,7 +153,7 @@ class MemoryManager:
                     self._link_bidirectional(note, old)
         return WriteResult("added", note, message="新建")
 
-    def _find_duplicate(self, note: Note) -> Optional[WriteResult]:
+    def _find_duplicate(self, note: Note, namespace: str = SHARED) -> Optional[WriteResult]:
         # I4：幂等键优先
         if note.idempotency_key:
             for existing_id in self.index.find_by_idempotency_key(note.idempotency_key):
@@ -175,20 +175,21 @@ class MemoryManager:
                 return WriteResult("duplicate", old, related=same_title,
                                    message="标题与正文相同，跳过")
             if old:
-                return self._supersede(old, note)
+                return self._supersede(old, note, namespace)
         near = self._near_duplicates(note)
         if near:
             old = self.store.find_by_id(near[0])
             if old:
-                return self._supersede(old, note)
+                return self._supersede(old, note, namespace)
         return None
 
-    def _supersede(self, old: Note, new: Note) -> WriteResult:
+    def _supersede(self, old: Note, new: Note, namespace: str = SHARED) -> WriteResult:
         new.supersedes = sorted(set(new.supersedes) | {old.id})
         old.superseded_by = new.id
         old.status = "superseded"
         old.updated = now_iso()
-        ns = self.store.namespace_of(new.path or self.store.path_for(new))
+        # 写者命名空间必须沿用（不能从尚未落盘的 new.path 推断 → 会落回 shared，契约 §4.7）
+        ns = self.store.normalize_namespace(namespace)
         self.store.write(new, namespace=ns, locked=True)
         self.index.upsert(new, vector=self._vector_for(new))
         self.store.write(old, namespace=self.store.namespace_of(old.path), locked=True)

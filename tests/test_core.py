@@ -60,6 +60,27 @@ def test_supersede(tmp_path):
     assert b.note.id in old.superseded_by
 
 
+def test_supersede_preserves_namespace(tmp_path):
+    """回归：同题不同正文触发 supersede 时，新笔记必须沿用写者命名空间（勿落 shared）。
+
+    契约 §4.7 / CI-026/CI-033：私有命名空间隔离。
+    """
+    store, index, mgr, _ = fresh(tmp_path)
+    a = mgr.add("T", "body one", layer="procedural", namespace="agents/hopper")
+    assert a.status == "added"
+    assert store.namespace_of(a.note.path) == "agents/hopper"
+
+    b = mgr.add("T", "body two", layer="procedural", namespace="agents/hopper")
+    assert b.status == "superseded"
+    assert store.namespace_of(b.note.path) == "agents/hopper", f"落错命名空间: {b.note.path}"
+    # 精确重复仍 NOOP，且不跨命名空间
+    c = mgr.add("T", "body one", layer="procedural", namespace="agents/hopper")
+    assert c.status == "duplicate"
+    assert store.namespace_of(c.note.path) == "agents/hopper"
+    # shared/ 下不应出现任何写入
+    assert not list((store.memdir / "procedural").glob("*.md"))
+
+
 def test_update_link_and_neighbors(tmp_path):
     store, index, mgr, _ = fresh(tmp_path)
     a = mgr.add("A", "aaa")
